@@ -22,12 +22,16 @@ pub fn normalizeForProvider(
 
 pub fn freeMessages(allocator: std.mem.Allocator, messages: []types.Message) void {
     for (messages) |message| {
-        for (message.content) |part| {
-            freePart(allocator, part);
-        }
-        allocator.free(message.content);
+        freeMessage(allocator, message);
     }
     allocator.free(messages);
+}
+
+pub fn freeMessage(allocator: std.mem.Allocator, message: types.Message) void {
+    for (message.content) |part| {
+        freePart(allocator, part);
+    }
+    allocator.free(message.content);
 }
 
 fn cloneMessages(
@@ -131,7 +135,7 @@ fn clonePart(
     };
 }
 
-fn freePart(allocator: std.mem.Allocator, part: types.ContentPart) void {
+pub fn freePart(allocator: std.mem.Allocator, part: types.ContentPart) void {
     switch (part) {
         .text => |text| allocator.free(text),
         .thinking => |thinking| {
