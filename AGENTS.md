@@ -33,7 +33,7 @@ It is not a frontend for another service. It is a standalone autonomous coding a
 - Build only:
   - `zig build`
 - Format:
-  - `zig fmt src/ai/*.zig src/agent/*.zig src/cli/*.zig src/main.zig src/tests.zig build.zig`
+  - `zig fmt src/**/*.zig src/*.zig build.zig`
 
 ## Architecture Boundaries
 
@@ -46,12 +46,19 @@ It is not a frontend for another service. It is a standalone autonomous coding a
   - Agent loop, tool dispatch, event emission, message ownership.
 - `src/ai/`:
   - Provider adapters, HTTP/SSE transport, model registry, message normalization.
+- `src/runtime/`:
+  - Event loop, timers, scheduling, and runtime primitives shared by higher layers.
+  - No CLI policy, provider logic, or agent decision-making.
+- `src/tui/`:
+  - Terminal UI primitives, rendering, input decoding, editor behavior, and viewport logic.
+  - No provider logic and no agent loop internals.
 
 When adding modules, prefer domain folders over utility buckets.
 
 ## Coding Rules
 
-- Use explicit integer types unless there is a concrete reason not to.
+- Use explicit integer types for persisted formats, protocol fields, and cross-boundary data. Use
+  `usize` for indexes, lengths, and memory sizes.
 - Keep control flow simple and bounded. No recursion.
 - Add assertions for preconditions and invariants.
 - Prefer small functions with single responsibility.

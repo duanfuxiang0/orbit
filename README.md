@@ -56,7 +56,7 @@ zig fmt src/ai/*.zig src/agent/*.zig src/cli/*.zig src/main.zig src/tests.zig bu
 - **Safety first** - Assertions, bounds checking, explicit types
 - **Simple and bounded** - No recursion, explicit control flow
 - **Testable** - Deterministic tests, clear invariants
-- **Minimal dependencies** - Zig toolchain only
+- **Minimal dependencies** - Every dependency must justify its cost
 
 ## Reference Materials
 
@@ -74,9 +74,9 @@ Follow the guidelines in `AGENTS.md` and `STYLE.md`. Key points:
 - Explain the "why", not just the "what"
 - Keep changes minimal and composable
 - Add assertions for preconditions and invariants
-- Functions must be ≤70 lines
+- Functions should usually fit on one screen
 - Lines must be ≤100 columns
-- Use explicit integer types (u32, u64, etc.)
+- Use explicit integer types for persisted and boundary data
 
 ## License
 
