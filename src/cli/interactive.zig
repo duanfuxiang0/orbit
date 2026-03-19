@@ -417,13 +417,18 @@ const StreamSinkCtx = struct {
                 renderToolLine(self.writer, fallback_label, fallback_state, true);
             },
             .turn_end => |payload| {
+                _ = payload;
                 self.flushMarkdown();
                 self.endDanglingToolLine();
-                var buf: [128]u8 = undefined;
+            },
+            .agent_end => |payload| {
+                self.flushMarkdown();
+                self.endDanglingToolLine();
+                var buf: [160]u8 = undefined;
                 const msg = std.fmt.bufPrint(&buf, "{s}tokens: {d} in / {d} out{s}\n", .{
                     ansi.dim,
-                    payload.usage.input,
-                    payload.usage.output,
+                    payload.total_usage.input,
+                    payload.total_usage.output,
                     ansi.reset,
                 }) catch return;
                 self.writer.writeAll(msg) catch {};
@@ -844,6 +849,7 @@ const RawMode = struct {
         raw.lflag.ECHO = false;
         raw.lflag.ICANON = false;
         raw.lflag.IEXTEN = false;
+        raw.lflag.ISIG = false;
         raw.cc[@intFromEnum(posix.V.MIN)] = 1;
         raw.cc[@intFromEnum(posix.V.TIME)] = 0;
         try posix.tcsetattr(file.handle, .FLUSH, raw);
@@ -1050,7 +1056,7 @@ test "append-only markdown path updates renderer backbuffer" {
     try std.testing.expectEqualStrings(" hello world", sink.md_renderer.backbuffer.items[0]);
 }
 
-test "turn_end flushes pending markdown render" {
+test "turn_end flushes markdown and usage prints once on agent_end" {
     const allocator = std.testing.allocator;
 
     var event_loop: runtime.EventLoop = undefined;
@@ -1077,6 +1083,18 @@ test "turn_end flushes pending markdown render" {
             .tool_call_count = 0,
         },
     });
+    StreamSinkCtx.onEvent(&sink, .{
+        .turn_end = .{
+            .usage = .{ .input = 10, .output = 5 },
+            .tool_call_count = 1,
+        },
+    });
+    StreamSinkCtx.onEvent(&sink, .{
+        .agent_end = .{
+            .total_usage = .{ .input = 10, .output = 5 },
+            .stop_reason = .complete,
+        },
+    });
 
     try std.testing.expect(!sink.render_pending);
     try std.testing.expect(!sink.has_md_content);
@@ -1087,5 +1105,6 @@ test "turn_end flushes pending markdown render" {
     defer allocator.free(output);
 
     try std.testing.expect(std.mem.indexOf(u8, output, "hello throttled markdown") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output, "tokens: 0 in / 0 out") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "tokens: 10 in / 5 out") != null);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, output, "tokens: "));
 }
