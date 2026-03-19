@@ -60,24 +60,6 @@ zig fmt src/*
 
 ## Reference Materials
 
-The `references/` directory contains complete projects for learning:
 - `flow` - Vaxis TUI architecture and patterns
 - `bun` - Large Zig codebase organization
 - `tigerbeetle` - Safety, performance, and testing discipline
-- `nullclaw` - Additional reference
-
-See `references/AGENTS.md` for detailed guidance on using these materials.
-
-## Contributing
-
-Follow the guidelines in `AGENTS.md` and `STYLE.md`. Key points:
-- Explain the "why", not just the "what"
-- Keep changes minimal and composable
-- Add assertions for preconditions and invariants
-- Functions should usually fit on one screen
-- Lines must be ≤100 columns
-- Use explicit integer types for persisted and boundary data
-
-## License
-
-[To be determined]
