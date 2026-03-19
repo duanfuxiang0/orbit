@@ -243,6 +243,7 @@ pub const Agent = struct {
         });
 
         const result = self.runTool(tool_call);
+        defer result.deinit(self.allocator);
         try self.appendToolResult(tool_call.id, result);
 
         sink.send(.{
@@ -550,6 +551,74 @@ test "agent executes tool call and continues loop" {
     try std.testing.expectEqualStrings("tool-ok", agent.messages.items[2].content[0].tool_result.content);
 }
 
+test "agent releases owned tool execution buffers" {
+    const turn1_events = [_]ai.StreamEvent{
+        .{ .tool_call_start = .{ .id = "call_1", .name = "alloc" } },
+        .{ .tool_call_delta = .{ .id = "call_1", .args_delta = "{\"q\":" } },
+        .{
+            .tool_call_done = .{
+                .id = "call_1",
+                .name = "alloc",
+                .arguments = "{\"q\":\"x\"}",
+            },
+        },
+        .{
+            .done = .{
+                .usage = .{},
+                .stop_reason = .tool_use,
+            },
+        },
+    };
+    const turn2_events = [_]ai.StreamEvent{
+        .{
+            .done = .{
+                .usage = .{},
+                .stop_reason = .end_turn,
+            },
+        },
+    };
+    const turns = [_]FakeTurn{
+        .{ .events = &turn1_events },
+        .{ .events = &turn2_events },
+    };
+
+    var tool_ctx = AllocatingToolCtx{
+        .allocator = std.testing.allocator,
+    };
+    const tools = [_]types.Tool{
+        .{
+            .name = "alloc",
+            .description = "Alloc tool",
+            .parameters_json = "{\"type\":\"object\"}",
+            .execute = AllocatingToolCtx.execute,
+            .ctx = &tool_ctx,
+        },
+    };
+
+    var provider = FakeProvider.init(&turns);
+    var agent = Agent.init(
+        std.testing.allocator,
+        provider.asProvider(),
+        ai.models.registry.gpt4o,
+        "system",
+        &tools,
+    );
+    defer agent.deinit();
+
+    var events: EventCapture = .{};
+    const sink = events.sink();
+    agent.prompt("run alloc", &sink, null);
+
+    try std.testing.expectEqual(@as(u32, 1), tool_ctx.calls);
+    try std.testing.expectEqual(@as(u32, 1), events.tool_exec_end_count);
+    try std.testing.expectEqual(@as(usize, 3), agent.messages.items.len);
+    try std.testing.expect(agent.messages.items[2].content[0] == .tool_result);
+    try std.testing.expectEqualStrings(
+        "tool-alloc",
+        agent.messages.items[2].content[0].tool_result.content,
+    );
+}
+
 test "missing tool produces error tool_result" {
     const turn1_events = [_]ai.StreamEvent{
         .{ .tool_call_start = .{ .id = "call_2", .name = "missing_tool" } },
@@ -763,6 +832,44 @@ const EchoToolCtx = struct {
         return .{
             .content = "tool-ok",
             .is_error = false,
+        };
+    }
+};
+
+const AllocatingToolCtx = struct {
+    allocator: std.mem.Allocator,
+    calls: u32 = 0,
+
+    fn execute(
+        ctx: *anyopaque,
+        tool_call_id: []const u8,
+        arguments: []const u8,
+        abort: *const ai.provider.AbortState,
+    ) types.ToolExecResult {
+        _ = tool_call_id;
+        _ = arguments;
+        _ = abort;
+        const self: *AllocatingToolCtx = @ptrCast(@alignCast(ctx));
+        self.calls += 1;
+
+        const content = std.fmt.allocPrint(self.allocator, "tool-{s}", .{"alloc"}) catch {
+            return .{
+                .content = "oom",
+                .is_error = true,
+            };
+        };
+        const ui_details = self.allocator.dupe(u8, "{\"exit_code\":0}") catch {
+            self.allocator.free(content);
+            return .{
+                .content = "oom",
+                .is_error = true,
+            };
+        };
+        return .{
+            .content = content,
+            .ui_details = ui_details,
+            .owns_content = true,
+            .owns_ui_details = true,
         };
     }
 };

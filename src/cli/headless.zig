@@ -3,6 +3,7 @@ const ai = @import("../ai/root.zig");
 const agent_mod = @import("../agent/root.zig");
 const agent_types = @import("../agent/types.zig");
 const session_mod = @import("session.zig");
+const stdin_lines = @import("stdin_lines.zig");
 const json_util = @import("../ai/json_util.zig");
 
 /// Headless JSON lines mode: reads prompts from stdin, emits events as JSON to stdout.
@@ -27,7 +28,7 @@ pub fn run(
         .emit = SinkCtx.onEvent,
     };
 
-    while (try reader.interface.takeDelimiter('\n')) |raw_line| {
+    while (try stdin_lines.takeLine(&reader.interface)) |raw_line| {
         const line = std.mem.trim(u8, raw_line, " \r\t");
         if (line.len == 0) continue;
         if (std.mem.eql(u8, line, "/exit")) break;

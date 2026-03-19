@@ -147,7 +147,10 @@ fn readImpl(ctx: *ToolCtx, arguments: []const u8) !agent.ToolExecResult {
         parsed.value.offset,
         clampLineLimit(parsed.value.limit),
     );
-    return .{ .content = rendered };
+    return .{
+        .content = rendered,
+        .owns_content = true,
+    };
 }
 
 fn executeWrite(
@@ -187,6 +190,8 @@ fn writeImpl(ctx: *ToolCtx, arguments: []const u8) !agent.ToolExecResult {
     return .{
         .content = content,
         .ui_details = details,
+        .owns_content = true,
+        .owns_ui_details = true,
     };
 }
 
@@ -239,6 +244,8 @@ fn editImpl(ctx: *ToolCtx, arguments: []const u8) !agent.ToolExecResult {
     return .{
         .content = content,
         .ui_details = details,
+        .owns_content = true,
+        .owns_ui_details = true,
     };
 }
 
@@ -322,12 +329,16 @@ fn bashImpl(
             .content = timeout_text,
             .is_error = true,
             .ui_details = details,
+            .owns_content = true,
+            .owns_ui_details = true,
         };
     }
 
     return .{
         .content = output,
         .ui_details = details,
+        .owns_content = true,
+        .owns_ui_details = true,
     };
 }
 
@@ -562,10 +573,16 @@ fn toolError(
     comptime fmt: []const u8,
     args: anytype,
 ) agent.ToolExecResult {
-    const message = std.fmt.allocPrint(allocator, fmt, args) catch "tool error";
+    const message = std.fmt.allocPrint(allocator, fmt, args) catch {
+        return .{
+            .content = "tool error",
+            .is_error = true,
+        };
+    };
     return .{
         .content = message,
         .is_error = true,
+        .owns_content = true,
     };
 }
 
@@ -587,8 +604,7 @@ test "read tool numbers lines" {
         "{\"path\":\"note.txt\",\"offset\":1,\"limit\":2}",
         &.{},
     );
-    defer allocator.free(result.content);
-    if (result.ui_details) |details| allocator.free(details);
+    defer result.deinit(allocator);
 
     try std.testing.expect(!result.is_error);
     try std.testing.expect(std.mem.indexOf(u8, result.content, "2: b") != null);
@@ -611,8 +627,7 @@ test "write and edit tools update files" {
         "{\"path\":\"dir/file.txt\",\"content\":\"hello world\"}",
         &.{},
     );
-    defer allocator.free(write_result.content);
-    if (write_result.ui_details) |details| allocator.free(details);
+    defer write_result.deinit(allocator);
     try std.testing.expect(!write_result.is_error);
 
     const edit_result = tools[2].execute(
@@ -621,8 +636,7 @@ test "write and edit tools update files" {
         "{\"path\":\"dir/file.txt\",\"old_text\":\"world\",\"new_text\":\"orbit\"}",
         &.{},
     );
-    defer allocator.free(edit_result.content);
-    if (edit_result.ui_details) |details| allocator.free(details);
+    defer edit_result.deinit(allocator);
     try std.testing.expect(!edit_result.is_error);
 
     const file = try temp.dir.openFile("dir/file.txt", .{});

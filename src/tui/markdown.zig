@@ -125,14 +125,24 @@ fn renderMarkdown(self: *Markdown, width: u16, allocator: Allocator) ![][]const 
 
     const content_width = computeContentWidth(width, self.padding_x);
     var in_code_block = false;
+    var previous_blank = false;
     var iterator = std.mem.splitScalar(u8, self.text, '\n');
     while (iterator.next()) |raw_line| {
         if (std.mem.startsWith(u8, raw_line, "```")) {
             in_code_block = !in_code_block;
+            previous_blank = false;
             continue;
         }
         if (in_code_block) {
             try appendCodeBlockWrapped(&lines, allocator, raw_line, self.padding_x, content_width);
+            previous_blank = false;
+            continue;
+        }
+        if (std.mem.trim(u8, raw_line, " \t\r").len == 0) {
+            if (!previous_blank and hasRenderedContent(lines.items, self.padding_y)) {
+                try appendBlankLine(&lines, allocator, self.padding_x);
+            }
+            previous_blank = true;
             continue;
         }
         if (raw_line.len > 0 and raw_line[0] == '#') {
@@ -145,9 +155,11 @@ fn renderMarkdown(self: *Markdown, width: u16, allocator: Allocator) ![][]const 
                 self.padding_x,
                 content_width,
             );
+            previous_blank = false;
             continue;
         }
         try appendInlineMarkdownWrapped(&lines, allocator, raw_line, self.padding_x, content_width);
+        previous_blank = false;
     }
 
     for (0..self.padding_y) |_| {
@@ -328,6 +340,20 @@ fn appendCodeBlockCell(
     try lines.append(allocator, merged);
 }
 
+fn appendBlankLine(
+    lines: *std.ArrayList([]const u8),
+    allocator: Allocator,
+    padding_x: u16,
+) !void {
+    const prefix = try makePadding(allocator, padding_x);
+    defer allocator.free(prefix);
+    try lines.append(allocator, try allocator.dupe(u8, prefix));
+}
+
+fn hasRenderedContent(lines: []const []const u8, padding_y: u16) bool {
+    return lines.len > padding_y;
+}
+
 fn makePadding(allocator: Allocator, count: u16) ![]u8 {
     const out = try allocator.alloc(u8, count);
     @memset(out, ' ');
@@ -361,4 +387,20 @@ test "markdown styles inline code spans with color" {
 
     try std.testing.expectEqual(@as(usize, 1), lines.len);
     try std.testing.expect(std.mem.indexOf(u8, lines[0], "\x1b[36mecho hi\x1b[0m") != null);
+}
+
+test "markdown collapses repeated blank lines outside code blocks" {
+    var md = Markdown.init(std.testing.allocator, "one\n\n\n\ntwo", 1, 0);
+    defer md.deinit();
+
+    const lines = try md.component().render(80, std.testing.allocator);
+    defer {
+        for (lines) |line| std.testing.allocator.free(line);
+        std.testing.allocator.free(lines);
+    }
+
+    try std.testing.expectEqual(@as(usize, 3), lines.len);
+    try std.testing.expectEqualStrings(" one", lines[0]);
+    try std.testing.expectEqualStrings(" ", lines[1]);
+    try std.testing.expectEqualStrings(" two", lines[2]);
 }

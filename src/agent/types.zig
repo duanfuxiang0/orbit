@@ -5,6 +5,15 @@ pub const ToolExecResult = struct {
     content: []const u8,
     is_error: bool = false,
     ui_details: ?[]const u8 = null,
+    owns_content: bool = false,
+    owns_ui_details: bool = false,
+
+    pub fn deinit(self: ToolExecResult, allocator: std.mem.Allocator) void {
+        if (self.owns_content) allocator.free(self.content);
+        if (self.owns_ui_details) {
+            if (self.ui_details) |details| allocator.free(details);
+        }
+    }
 };
 
 pub const Tool = struct {

@@ -4,6 +4,7 @@ const agent_mod = @import("../agent/root.zig");
 const agent_types = @import("../agent/types.zig");
 const session_mod = @import("session.zig");
 const runtime = @import("../runtime/root.zig");
+const stdin_lines = @import("stdin_lines.zig");
 const tui = @import("../tui/root.zig");
 const ansi = @import("../tui/ansi.zig");
 const terminal = @import("../tui/terminal.zig");
@@ -18,6 +19,12 @@ const ToolLineState = enum {
     running,
     done,
     err,
+};
+
+const OutputBlock = enum {
+    none,
+    markdown,
+    tool,
 };
 
 const ActiveToolLine = struct {
@@ -89,7 +96,7 @@ fn handleSubmit(
     const trimmed = std.mem.trim(u8, text, " \t\r\n");
     if (trimmed.len == 0) return false;
 
-    try writer.writeAll("\r\n");
+    try writer.writeAll("\r\n\r\n");
     renderer.invalidate();
 
     if (std.mem.eql(u8, trimmed, "/exit")) return true;
@@ -187,6 +194,7 @@ const StreamSinkCtx = struct {
     last_rendered_text_len: usize,
     last_render_width: u16,
     active_tool: ?ActiveToolLine,
+    last_output_block: OutputBlock,
 
     fn init(
         allocator: std.mem.Allocator,
@@ -207,6 +215,7 @@ const StreamSinkCtx = struct {
             .last_rendered_text_len = 0,
             .last_render_width = 0,
             .active_tool = null,
+            .last_output_block = .none,
         };
     }
 
@@ -248,6 +257,7 @@ const StreamSinkCtx = struct {
         self.render_pending = false;
         self.last_rendered_text_len = 0;
         self.last_render_width = 0;
+        self.last_output_block = .markdown;
     }
 
     fn renderMdLocked(self: *StreamSinkCtx) void {
@@ -359,6 +369,20 @@ const StreamSinkCtx = struct {
         if (self.active_tool == null) return;
         self.writer.writeAll("\n") catch {};
         self.clearActiveToolState();
+        self.last_output_block = .tool;
+    }
+
+    fn writeBlockSeparator(self: *StreamSinkCtx) void {
+        if (self.last_output_block == .none) return;
+        self.writer.writeAll("\n") catch {};
+    }
+
+    fn beginMarkdownBlockLocked(self: *StreamSinkCtx) void {
+        if (self.has_md_content) return;
+        if (self.text_buf.items.len != 0) return;
+        if (self.last_output_block != .tool) return;
+        self.writer.writeAll("\n") catch {};
+        self.last_output_block = .none;
     }
 
     fn onEvent(raw_ctx: *anyopaque, event: agent_types.AgentEvent) void {
@@ -367,6 +391,7 @@ const StreamSinkCtx = struct {
             .text_delta => |text| {
                 self.mutex.lock();
                 defer self.mutex.unlock();
+                self.beginMarkdownBlockLocked();
                 self.text_buf.appendSlice(self.allocator, text) catch return;
                 self.renderMdLocked();
             },
@@ -378,6 +403,7 @@ const StreamSinkCtx = struct {
             .tool_exec_start => |payload| {
                 self.flushMarkdown();
                 self.endDanglingToolLine();
+                self.writeBlockSeparator();
 
                 const label = formatToolLabel(
                     self.allocator,
@@ -393,6 +419,7 @@ const StreamSinkCtx = struct {
                     .label = label,
                 };
                 renderToolLine(self.writer, label, .running, false);
+                self.last_output_block = .tool;
             },
             .tool_exec_end => |payload| {
                 if (self.active_tool) |active| {
@@ -402,6 +429,7 @@ const StreamSinkCtx = struct {
                         const state: ToolLineState = if (payload.is_error) .err else .done;
                         renderToolLine(self.writer, active.label, state, true);
                         self.clearActiveToolState();
+                        self.last_output_block = .tool;
                         return;
                     }
                 }
@@ -415,6 +443,7 @@ const StreamSinkCtx = struct {
                 defer self.allocator.free(fallback_label);
                 const fallback_state: ToolLineState = if (payload.is_error) .err else .done;
                 renderToolLine(self.writer, fallback_label, fallback_state, true);
+                self.last_output_block = .tool;
             },
             .turn_end => |payload| {
                 _ = payload;
@@ -719,7 +748,9 @@ fn appendDeltaToRenderedLines(
             );
         }
         if (next_newline == delta.len) break;
-        try lines.append(allocator, try allocator.dupe(u8, " "));
+        if (!lastRenderedLineIsBlank(lines.items)) {
+            try lines.append(allocator, try allocator.dupe(u8, " "));
+        }
         start = next_newline + 1;
     }
 
@@ -756,6 +787,13 @@ fn appendPlainTextChunk(
         lines.items[last_index] = merged;
         remaining = remaining[take..];
     }
+}
+
+fn lastRenderedLineIsBlank(lines: []const []const u8) bool {
+    if (lines.len == 0) return false;
+    const last = lines[lines.len - 1];
+    if (lineHasAnsi(last)) return false;
+    return std.mem.trim(u8, last, " ").len == 0;
 }
 
 fn markdownMaxLineLen(width: u16) usize {
@@ -814,14 +852,14 @@ fn runLineBuffered(
         .emit = StreamSinkCtx.onEvent,
     };
 
-    while (try reader.interface.takeDelimiter('\n')) |raw_line| {
+    while (try stdin_lines.takeLine(&reader.interface)) |raw_line| {
         const line = std.mem.trim(u8, raw_line, " \r\t");
         if (line.len == 0) continue;
         if (std.mem.eql(u8, line, "/exit")) break;
 
         try stdout_file.writeAll("> ");
         try stdout_file.writeAll(line);
-        try stdout_file.writeAll("\n");
+        try stdout_file.writeAll("\n\n");
 
         agent.prompt(line, &sink, null);
         sink_ctx.flushMarkdown();
@@ -910,6 +948,16 @@ test "append delta to rendered lines wraps and appends" {
     try std.testing.expectEqual(@as(usize, 2), updated.len);
     try std.testing.expectEqualStrings(" hello worl", updated[0]);
     try std.testing.expectEqualStrings(" d", updated[1]);
+}
+
+test "append delta to rendered lines collapses repeated blank lines" {
+    const allocator = std.testing.allocator;
+    const previous = [_][]const u8{" hello"};
+    const updated = try appendDeltaToRenderedLines(allocator, &previous, "\n\nworld", 12);
+    defer lines_util.freeLines(allocator, updated);
+
+    try std.testing.expectEqual(@as(usize, 2), updated.len);
+    try std.testing.expectEqualStrings(" world", updated[1]);
 }
 
 test "tool summary compacts whitespace and truncates" {
@@ -1004,6 +1052,104 @@ test "tool execution status rewrites same line with args" {
     try std.testing.expect(std.mem.indexOf(u8, output, "duration_ms") == null);
     try std.testing.expect(std.mem.indexOf(u8, output, "✓") != null);
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, output, "\n"));
+}
+
+test "tool output inserts blank line between tool blocks" {
+    const allocator = std.testing.allocator;
+
+    var event_loop: runtime.EventLoop = undefined;
+    try event_loop.init(allocator);
+    defer event_loop.deinit();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const file = try tmp.dir.createFile("stream_sink_tool_spacing", .{ .read = true });
+    defer file.close();
+
+    var sink = StreamSinkCtx.init(allocator, file, &event_loop);
+    defer sink.deinit();
+
+    StreamSinkCtx.onEvent(&sink, .{
+        .tool_exec_start = .{
+            .id = "toolu_1",
+            .name = "read",
+            .arguments = "{\"path\":\"a.txt\"}",
+        },
+    });
+    StreamSinkCtx.onEvent(&sink, .{
+        .tool_exec_end = .{
+            .id = "toolu_1",
+            .name = "read",
+            .is_error = false,
+            .ui_details = "{}",
+        },
+    });
+    StreamSinkCtx.onEvent(&sink, .{
+        .tool_exec_start = .{
+            .id = "toolu_2",
+            .name = "bash",
+            .arguments = "{\"command\":\"echo hi\"}",
+        },
+    });
+    StreamSinkCtx.onEvent(&sink, .{
+        .tool_exec_end = .{
+            .id = "toolu_2",
+            .name = "bash",
+            .is_error = false,
+            .ui_details = "{}",
+        },
+    });
+
+    try file.seekTo(0);
+    const stat = try file.stat();
+    const output = try file.readToEndAlloc(allocator, @intCast(stat.size));
+    defer allocator.free(output);
+
+    try std.testing.expect(std.mem.indexOf(u8, output, "\n\n\r\x1b[2K") != null);
+}
+
+test "markdown output inserts blank line after tool block" {
+    const allocator = std.testing.allocator;
+
+    var event_loop: runtime.EventLoop = undefined;
+    try event_loop.init(allocator);
+    defer event_loop.deinit();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const file = try tmp.dir.createFile("stream_sink_markdown_spacing", .{ .read = true });
+    defer file.close();
+
+    var sink = StreamSinkCtx.init(allocator, file, &event_loop);
+    defer sink.deinit();
+
+    StreamSinkCtx.onEvent(&sink, .{
+        .tool_exec_start = .{
+            .id = "toolu_1",
+            .name = "bash",
+            .arguments = "{\"command\":\"echo hi\"}",
+        },
+    });
+    StreamSinkCtx.onEvent(&sink, .{
+        .tool_exec_end = .{
+            .id = "toolu_1",
+            .name = "bash",
+            .is_error = false,
+            .ui_details = "{}",
+        },
+    });
+    StreamSinkCtx.onEvent(&sink, .{ .text_delta = "hello" });
+    sink.flushMarkdown();
+
+    try file.seekTo(0);
+    const stat = try file.stat();
+    const output = try file.readToEndAlloc(allocator, @intCast(stat.size));
+    defer allocator.free(output);
+
+    try std.testing.expect(std.mem.indexOf(u8, output, "✓\x1b[0m\n\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "hello") != null);
 }
 
 test "throttled text delta flushes at frame deadline" {
