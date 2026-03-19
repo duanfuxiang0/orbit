@@ -6,5 +6,7 @@ test {
     _ = @import("cli/session.zig");
     _ = @import("cli/coding_tools.zig");
     _ = @import("cli/headless.zig");
+    _ = @import("cli/interactive.zig");
     _ = @import("cli/root.zig");
+    _ = @import("tui/root.zig");
 }

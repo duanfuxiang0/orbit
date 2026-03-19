@@ -5,6 +5,7 @@ const coding_tools = @import("coding_tools.zig");
 const config_mod = @import("config.zig");
 const context_files = @import("context_files.zig");
 const headless = @import("headless.zig");
+const interactive = @import("interactive.zig");
 const session_mod = @import("session.zig");
 
 pub const CliArgs = struct {
@@ -70,7 +71,7 @@ pub fn run(allocator: std.mem.Allocator) !void {
     if (args.headless) {
         try headless.run(allocator, &agent, &session);
     } else {
-        try headless.runText(allocator, &agent, &session);
+        try interactive.run(allocator, &agent, &session);
     }
 
     session.updated_at = std.time.timestamp();
