@@ -1,5 +1,7 @@
 const std = @import("std");
 const ansi = @import("ansi.zig");
+const theme = @import("theme.zig");
+const highlight = @import("highlight.zig");
 const component_mod = @import("component.zig");
 const lines_util = @import("lines_util.zig");
 
@@ -12,6 +14,7 @@ pub const Markdown = struct {
     owned_text: ?[]u8 = null,
     padding_x: u16,
     padding_y: u16,
+    theme: theme.Theme,
     cached_width: ?u16 = null,
     cached_lines: ?[][]const u8 = null,
 
@@ -20,12 +23,14 @@ pub const Markdown = struct {
         text: []const u8,
         padding_x: u16,
         padding_y: u16,
+        current_theme: theme.Theme,
     ) Markdown {
         return .{
             .allocator = allocator,
             .text = text,
             .padding_x = padding_x,
             .padding_y = padding_y,
+            .theme = current_theme,
         };
     }
 
@@ -125,19 +130,46 @@ fn renderMarkdown(self: *Markdown, width: u16, allocator: Allocator) ![][]const 
 
     const content_width = computeContentWidth(width, self.padding_x);
     var in_code_block = false;
+    var code_language: highlight.Language = .unknown;
     var previous_blank = false;
     var iterator = std.mem.splitScalar(u8, self.text, '\n');
     while (iterator.next()) |raw_line| {
         if (std.mem.startsWith(u8, raw_line, "```")) {
-            in_code_block = !in_code_block;
+            if (!in_code_block) {
+                const info = std.mem.trim(u8, raw_line[3..], " \t\r");
+                code_language = highlight.detectLanguage(info);
+                in_code_block = true;
+            } else {
+                in_code_block = false;
+                code_language = .unknown;
+            }
+            try appendSingleStyleWrapped(
+                &lines,
+                allocator,
+                raw_line,
+                .plain,
+                self.theme,
+                self.padding_x,
+                content_width,
+            );
             previous_blank = false;
             continue;
         }
+
         if (in_code_block) {
-            try appendCodeBlockWrapped(&lines, allocator, raw_line, self.padding_x, content_width);
+            try appendCodeBlockWrapped(
+                &lines,
+                allocator,
+                raw_line,
+                code_language,
+                self.theme,
+                self.padding_x,
+                content_width,
+            );
             previous_blank = false;
             continue;
         }
+
         if (std.mem.trim(u8, raw_line, " \t\r").len == 0) {
             if (!previous_blank and hasRenderedContent(lines.items, self.padding_y)) {
                 try appendBlankLine(&lines, allocator, self.padding_x);
@@ -145,6 +177,7 @@ fn renderMarkdown(self: *Markdown, width: u16, allocator: Allocator) ![][]const 
             previous_blank = true;
             continue;
         }
+
         if (raw_line.len > 0 and raw_line[0] == '#') {
             const heading = std.mem.trimLeft(u8, raw_line, "# ");
             try appendSingleStyleWrapped(
@@ -152,13 +185,22 @@ fn renderMarkdown(self: *Markdown, width: u16, allocator: Allocator) ![][]const 
                 allocator,
                 heading,
                 .heading,
+                self.theme,
                 self.padding_x,
                 content_width,
             );
             previous_blank = false;
             continue;
         }
-        try appendInlineMarkdownWrapped(&lines, allocator, raw_line, self.padding_x, content_width);
+
+        try appendInlineMarkdownWrapped(
+            &lines,
+            allocator,
+            raw_line,
+            self.theme,
+            self.padding_x,
+            content_width,
+        );
         previous_blank = false;
     }
 
@@ -180,17 +222,19 @@ fn appendSingleStyleWrapped(
     allocator: Allocator,
     text: []const u8,
     style: TextStyle,
+    current_theme: theme.Theme,
     padding_x: u16,
     width: usize,
 ) !void {
     var spans: [1]StyledSpan = .{.{ .style = style, .text = text }};
-    try appendStyledWrapped(lines, allocator, spans[0..], padding_x, width);
+    try appendStyledWrapped(lines, allocator, spans[0..], current_theme, padding_x, width);
 }
 
 fn appendInlineMarkdownWrapped(
     lines: *std.ArrayList([]const u8),
     allocator: Allocator,
     line: []const u8,
+    current_theme: theme.Theme,
     padding_x: u16,
     width: usize,
 ) !void {
@@ -215,25 +259,29 @@ fn appendInlineMarkdownWrapped(
         }
         cursor = close + 1;
     }
+
     if (cursor < line.len) {
         try spans.append(allocator, .{
             .style = .plain,
             .text = line[cursor..],
         });
     }
+
     if (spans.items.len == 0) {
         try spans.append(allocator, .{
             .style = .plain,
             .text = line,
         });
     }
-    try appendStyledWrapped(lines, allocator, spans.items, padding_x, width);
+
+    try appendStyledWrapped(lines, allocator, spans.items, current_theme, padding_x, width);
 }
 
 fn appendStyledWrapped(
     lines: *std.ArrayList([]const u8),
     allocator: Allocator,
     spans: []const StyledSpan,
+    current_theme: theme.Theme,
     padding_x: u16,
     width: usize,
 ) !void {
@@ -259,7 +307,7 @@ fn appendStyledWrapped(
 
             const room = width - visible_len;
             const take = @min(room, remaining.len);
-            try appendStyledChunk(allocator, &current, span.style, remaining[0..take]);
+            try appendStyledChunk(allocator, &current, span.style, remaining[0..take], current_theme);
             visible_len += take;
             remaining = remaining[take..];
         }
@@ -277,16 +325,22 @@ fn appendStyledChunk(
     out: *std.ArrayList(u8),
     style: TextStyle,
     chunk: []const u8,
+    current_theme: theme.Theme,
 ) !void {
     switch (style) {
         .plain => try out.appendSlice(allocator, chunk),
         .heading => {
-            const styled = try ansi.boldText(allocator, chunk);
+            const styled = try ansi.boldText(allocator, current_theme, chunk);
             defer allocator.free(styled);
             try out.appendSlice(allocator, styled);
         },
         .inline_code => {
-            const styled = try ansi.colored(allocator, chunk, .cyan);
+            const styled = try ansi.fgColor(
+                allocator,
+                current_theme,
+                chunk,
+                current_theme.palette.code_fg,
+            );
             defer allocator.free(styled);
             try out.appendSlice(allocator, styled);
         },
@@ -297,6 +351,8 @@ fn appendCodeBlockWrapped(
     lines: *std.ArrayList([]const u8),
     allocator: Allocator,
     line: []const u8,
+    language: highlight.Language,
+    current_theme: theme.Theme,
     padding_x: u16,
     width: usize,
 ) !void {
@@ -306,14 +362,22 @@ fn appendCodeBlockWrapped(
     defer allocator.free(prefix);
 
     if (line.len == 0) {
-        try appendCodeBlockCell(lines, allocator, prefix, "", width);
+        try appendCodeBlockCell(lines, allocator, prefix, "", language, current_theme, width);
         return;
     }
 
     var start: usize = 0;
     while (start < line.len) {
         const end = @min(start + width, line.len);
-        try appendCodeBlockCell(lines, allocator, prefix, line[start..end], width);
+        try appendCodeBlockCell(
+            lines,
+            allocator,
+            prefix,
+            line[start..end],
+            language,
+            current_theme,
+            width,
+        );
         start = end;
     }
 }
@@ -323,21 +387,38 @@ fn appendCodeBlockCell(
     allocator: Allocator,
     prefix: []const u8,
     segment: []const u8,
+    language: highlight.Language,
+    current_theme: theme.Theme,
     width: usize,
 ) !void {
-    var padded: std.ArrayList(u8) = .{};
-    defer padded.deinit(allocator);
+    std.debug.assert(width >= segment.len);
 
-    try padded.appendSlice(allocator, segment);
-    if (segment.len < width) {
-        const fill = width - segment.len;
-        try padded.appendNTimes(allocator, ' ', fill);
+    var merged: std.ArrayList(u8) = .{};
+    errdefer merged.deinit(allocator);
+    try merged.appendSlice(allocator, prefix);
+
+    const fill = width - segment.len;
+    if (!current_theme.isColorEnabled()) {
+        try merged.appendSlice(allocator, segment);
+        if (fill > 0) try merged.appendNTimes(allocator, ' ', fill);
+        try lines.append(allocator, try merged.toOwnedSlice(allocator));
+        return;
     }
 
-    const styled = try ansi.bgGray(allocator, padded.items);
-    defer allocator.free(styled);
-    const merged = try std.fmt.allocPrint(allocator, "{s}{s}", .{ prefix, styled });
-    try lines.append(allocator, merged);
+    const highlighted = try highlight.renderLine(allocator, segment, language, current_theme);
+    defer allocator.free(highlighted);
+
+    var fg_buf: [24]u8 = undefined;
+    const fg_prefix = ansi.fgPrefix(&fg_buf, current_theme, current_theme.palette.code_fg);
+    if (fg_prefix.len > 0) try merged.appendSlice(allocator, fg_prefix);
+
+    try merged.appendSlice(allocator, highlighted);
+    if (fill > 0) try merged.appendNTimes(allocator, ' ', fill);
+
+    const reset_code = ansi.resetCode(current_theme);
+    if (reset_code.len > 0) try merged.appendSlice(allocator, reset_code);
+
+    try lines.append(allocator, try merged.toOwnedSlice(allocator));
 }
 
 fn appendBlankLine(
@@ -360,8 +441,16 @@ fn makePadding(allocator: Allocator, count: u16) ![]u8 {
     return out;
 }
 
-test "markdown renders headings and code blocks" {
-    var md = Markdown.init(std.testing.allocator, "# Title\n```\nzig\n```", 1, 0);
+test "markdown renders headings and highlighted code blocks" {
+    const current_theme = theme.themeFor(.ansi256, .dark);
+
+    var md = Markdown.init(
+        std.testing.allocator,
+        "# Title\n```zig\nconst n: u32 = 1;\n```",
+        1,
+        0,
+        current_theme,
+    );
     defer md.deinit();
 
     const lines = try md.component().render(40, std.testing.allocator);
@@ -370,13 +459,37 @@ test "markdown renders headings and code blocks" {
         std.testing.allocator.free(lines);
     }
 
-    try std.testing.expect(lines.len >= 2);
-    try std.testing.expect(std.mem.indexOf(u8, lines[0], "Title") != null);
-    try std.testing.expect(std.mem.indexOf(u8, lines[1], "\x1b[48;5;236mzig") != null);
+    try std.testing.expect(lines.len >= 4);
+
+    var saw_title = false;
+    var saw_open_fence = false;
+    var saw_close_fence = false;
+    var saw_code_text = false;
+    var saw_code_ansi = false;
+
+    for (lines) |line| {
+        if (std.mem.indexOf(u8, line, "Title") != null) saw_title = true;
+        if (std.mem.indexOf(u8, line, "```zig") != null) saw_open_fence = true;
+        if (std.mem.indexOf(u8, line, "const") != null) saw_code_text = true;
+        if (std.mem.indexOf(u8, line, "\x1b[") != null and
+            std.mem.indexOf(u8, line, "const") != null)
+        {
+            saw_code_ansi = true;
+        }
+        if (std.mem.eql(u8, std.mem.trim(u8, line, " "), "```")) saw_close_fence = true;
+    }
+
+    try std.testing.expect(saw_title);
+    try std.testing.expect(saw_open_fence);
+    try std.testing.expect(saw_close_fence);
+    try std.testing.expect(saw_code_text);
+    try std.testing.expect(saw_code_ansi);
 }
 
 test "markdown styles inline code spans with color" {
-    var md = Markdown.init(std.testing.allocator, "run `echo hi` now", 1, 0);
+    const current_theme = theme.themeFor(.ansi16, .dark);
+
+    var md = Markdown.init(std.testing.allocator, "run `echo hi` now", 1, 0, current_theme);
     defer md.deinit();
 
     const lines = try md.component().render(80, std.testing.allocator);
@@ -386,11 +499,36 @@ test "markdown styles inline code spans with color" {
     }
 
     try std.testing.expectEqual(@as(usize, 1), lines.len);
-    try std.testing.expect(std.mem.indexOf(u8, lines[0], "\x1b[36mecho hi\x1b[0m") != null);
+    try std.testing.expect(std.mem.indexOf(u8, lines[0], "echo hi") != null);
+    try std.testing.expect(std.mem.indexOf(u8, lines[0], "\x1b[") != null);
+}
+
+test "markdown skips code background on ansi16" {
+    const current_theme = theme.themeFor(.ansi16, .dark);
+
+    var md = Markdown.init(std.testing.allocator, "```zig\nconst x = 1\n```", 1, 0, current_theme);
+    defer md.deinit();
+
+    const lines = try md.component().render(40, std.testing.allocator);
+    defer {
+        for (lines) |line| std.testing.allocator.free(line);
+        std.testing.allocator.free(lines);
+    }
+
+    var saw_const = false;
+    for (lines) |line| {
+        if (std.mem.indexOf(u8, line, "const") != null) {
+            saw_const = true;
+            try std.testing.expect(std.mem.indexOf(u8, line, "\x1b[48;") == null);
+        }
+    }
+    try std.testing.expect(saw_const);
 }
 
 test "markdown collapses repeated blank lines outside code blocks" {
-    var md = Markdown.init(std.testing.allocator, "one\n\n\n\ntwo", 1, 0);
+    const current_theme = theme.forceNoColor();
+
+    var md = Markdown.init(std.testing.allocator, "one\n\n\n\ntwo", 1, 0, current_theme);
     defer md.deinit();
 
     const lines = try md.component().render(80, std.testing.allocator);

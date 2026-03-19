@@ -1,5 +1,6 @@
 const std = @import("std");
 const ansi = @import("ansi.zig");
+const theme = @import("theme.zig");
 const component_mod = @import("component.zig");
 
 const Allocator = std.mem.Allocator;
@@ -7,15 +8,17 @@ const Component = component_mod.Component;
 
 pub const ToolStatus = struct {
     allocator: Allocator,
+    current_theme: theme.Theme,
     name: []u8,
     state: State = .running,
     detail: ?[]u8 = null,
 
     pub const State = enum { running, done, err };
 
-    pub fn init(allocator: Allocator, name: []const u8) !ToolStatus {
+    pub fn init(allocator: Allocator, current_theme: theme.Theme, name: []const u8) !ToolStatus {
         return .{
             .allocator = allocator,
+            .current_theme = current_theme,
             .name = try allocator.dupe(u8, name),
         };
     }
@@ -59,10 +62,10 @@ pub const ToolStatus = struct {
             .done => "✓",
             .err => "✗",
         };
-        const color: ansi.Color = switch (self.state) {
-            .running => .yellow,
-            .done => .green,
-            .err => .red,
+        const color_value = switch (self.state) {
+            .running => self.current_theme.palette.tool_running,
+            .done => self.current_theme.palette.tool_success,
+            .err => self.current_theme.palette.tool_error,
         };
 
         const label = if (self.detail) |d|
@@ -71,12 +74,11 @@ pub const ToolStatus = struct {
             try allocator.dupe(u8, self.name);
         defer allocator.free(label);
 
-        const styled = try ansi.colored(allocator, label, color);
-        errdefer allocator.free(styled);
+        const styled = try ansi.fgColor(allocator, self.current_theme, label, color_value);
+        defer allocator.free(styled);
 
         const line = try std.fmt.allocPrint(allocator, "{s} {s}", .{ icon, styled });
         errdefer allocator.free(line);
-        allocator.free(styled);
 
         const lines = try allocator.alloc([]const u8, 1);
         lines[0] = line;
@@ -93,7 +95,9 @@ pub const ToolStatus = struct {
 
 test "tool status renders running state" {
     const allocator = std.testing.allocator;
-    var ts = try ToolStatus.init(allocator, "bash");
+    const current_theme = theme.themeFor(.ansi16, .dark);
+
+    var ts = try ToolStatus.init(allocator, current_theme, "bash");
     defer ts.deinit();
 
     const lines = try ts.component().render(80, allocator);
@@ -108,7 +112,9 @@ test "tool status renders running state" {
 
 test "tool status renders done with detail" {
     const allocator = std.testing.allocator;
-    var ts = try ToolStatus.init(allocator, "read");
+    const current_theme = theme.themeFor(.ansi16, .dark);
+
+    var ts = try ToolStatus.init(allocator, current_theme, "read");
     defer ts.deinit();
 
     try ts.setDone("src/main.zig");
@@ -126,7 +132,9 @@ test "tool status renders done with detail" {
 
 test "tool status renders error state" {
     const allocator = std.testing.allocator;
-    var ts = try ToolStatus.init(allocator, "edit");
+    const current_theme = theme.themeFor(.ansi16, .dark);
+
+    var ts = try ToolStatus.init(allocator, current_theme, "edit");
     defer ts.deinit();
 
     try ts.setError("not found");

@@ -7,13 +7,13 @@ const runtime = @import("../runtime/root.zig");
 const stdin_lines = @import("stdin_lines.zig");
 const tui = @import("../tui/root.zig");
 const ansi = @import("../tui/ansi.zig");
+const theme = @import("../tui/theme.zig");
 const terminal = @import("../tui/terminal.zig");
 const lines_util = @import("../tui/lines_util.zig");
 const posix = std.posix;
 const MIN_RENDER_INTERVAL_NS: i128 = 16_000_000;
 const MD_PADDING_X: u16 = 1;
 const max_tool_args_chars: usize = 120;
-const tool_name_orange = "\x1b[38;5;208m";
 
 const ToolLineState = enum {
     running,
@@ -47,11 +47,20 @@ pub fn run(
     defer event_loop.deinit();
 
     if (!stdin_file.isTty() or !stdout_file.isTty()) {
-        return runLineBuffered(allocator, agent, stdout_file, stdin_file, &event_loop);
+        const current_theme = theme.forceNoColor();
+        return runLineBuffered(
+            allocator,
+            agent,
+            stdout_file,
+            stdin_file,
+            &event_loop,
+            current_theme,
+        );
     }
 
     var raw = try RawMode.init(stdin_file, stdout_file);
     defer raw.deinit();
+    const current_theme = theme.detect(stdin_file, stdout_file);
 
     var ed = tui.Editor.init(allocator, "> ");
     defer ed.deinit();
@@ -69,6 +78,7 @@ pub fn run(
         .renderer = &renderer,
         .writer = stdout_file,
         .event_loop = &event_loop,
+        .current_theme = current_theme,
     };
     var byte_buf: [64]u8 = undefined;
     while (true) {
@@ -91,6 +101,7 @@ fn handleSubmit(
     renderer: *tui.InlineRenderer,
     writer: std.fs.File,
     event_loop: *runtime.EventLoop,
+    current_theme: theme.Theme,
 ) !bool {
     const text = ed.getText();
     const trimmed = std.mem.trim(u8, text, " \t\r\n");
@@ -104,7 +115,7 @@ fn handleSubmit(
     try ed.pushHistory();
     ed.clear();
 
-    var sink_ctx = StreamSinkCtx.init(allocator, writer, event_loop);
+    var sink_ctx = StreamSinkCtx.init(allocator, writer, event_loop, current_theme);
     defer sink_ctx.deinit();
 
     const sink: agent_types.AgentEventSink = .{
@@ -146,6 +157,7 @@ const InputCtx = struct {
     renderer: *tui.InlineRenderer,
     writer: std.fs.File,
     event_loop: *runtime.EventLoop,
+    current_theme: theme.Theme,
     needs_render: bool = false,
     should_exit: bool = false,
 
@@ -160,6 +172,7 @@ const InputCtx = struct {
                         self.renderer,
                         self.writer,
                         self.event_loop,
+                        self.current_theme,
                     );
                 },
                 .end_of_transmission => {
@@ -183,6 +196,7 @@ const InputCtx = struct {
 const StreamSinkCtx = struct {
     allocator: std.mem.Allocator,
     writer: std.fs.File,
+    current_theme: theme.Theme,
     text_buf: std.ArrayList(u8),
     md: tui.Markdown,
     md_renderer: tui.InlineRenderer,
@@ -193,6 +207,7 @@ const StreamSinkCtx = struct {
     render_pending: bool,
     last_rendered_text_len: usize,
     last_render_width: u16,
+    fenced_code_open: bool,
     active_tool: ?ActiveToolLine,
     last_output_block: OutputBlock,
 
@@ -200,13 +215,15 @@ const StreamSinkCtx = struct {
         allocator: std.mem.Allocator,
         writer: std.fs.File,
         event_loop: *runtime.EventLoop,
+        current_theme: theme.Theme,
     ) StreamSinkCtx {
         std.debug.assert(event_loop.worker != null);
         return .{
             .allocator = allocator,
             .writer = writer,
+            .current_theme = current_theme,
             .text_buf = .{},
-            .md = tui.Markdown.init(allocator, "", 1, 0),
+            .md = tui.Markdown.init(allocator, "", 1, 0, current_theme),
             .md_renderer = tui.InlineRenderer.init(allocator, writer),
             .render_timer = runtime.Timer.init(event_loop),
             .has_md_content = false,
@@ -214,6 +231,7 @@ const StreamSinkCtx = struct {
             .render_pending = false,
             .last_rendered_text_len = 0,
             .last_render_width = 0,
+            .fenced_code_open = false,
             .active_tool = null,
             .last_output_block = .none,
         };
@@ -257,6 +275,7 @@ const StreamSinkCtx = struct {
         self.render_pending = false;
         self.last_rendered_text_len = 0;
         self.last_render_width = 0;
+        self.fenced_code_open = false;
         self.last_output_block = .markdown;
     }
 
@@ -323,6 +342,7 @@ const StreamSinkCtx = struct {
 
     fn tryRenderMdAppendFastPathLocked(self: *StreamSinkCtx, width: u16) bool {
         if (!self.has_md_content) return false;
+        if (self.fenced_code_open) return false;
         if (self.last_render_width == 0 or self.last_render_width != width) return false;
         if (self.last_rendered_text_len > self.text_buf.items.len) return false;
 
@@ -393,12 +413,13 @@ const StreamSinkCtx = struct {
                 defer self.mutex.unlock();
                 self.beginMarkdownBlockLocked();
                 self.text_buf.appendSlice(self.allocator, text) catch return;
+                self.fenced_code_open = hasOpenFencedCodeBlock(self.text_buf.items);
                 self.renderMdLocked();
             },
             .thinking_delta => |text| {
-                self.writer.writeAll(ansi.dim) catch {};
+                self.writer.writeAll(ansi.dimCode(self.current_theme)) catch {};
                 self.writer.writeAll(text) catch {};
-                self.writer.writeAll(ansi.reset) catch {};
+                self.writer.writeAll(ansi.resetCode(self.current_theme)) catch {};
             },
             .tool_exec_start => |payload| {
                 self.flushMarkdown();
@@ -407,6 +428,7 @@ const StreamSinkCtx = struct {
 
                 const label = formatToolLabel(
                     self.allocator,
+                    self.current_theme,
                     payload.name,
                     payload.arguments,
                     max_tool_args_chars,
@@ -418,7 +440,8 @@ const StreamSinkCtx = struct {
                     .id = id,
                     .label = label,
                 };
-                renderToolLine(self.writer, label, .running, false);
+                const running_newline = !ansi.isEnabled(self.current_theme);
+                renderToolLine(self.writer, self.current_theme, label, .running, running_newline);
                 self.last_output_block = .tool;
             },
             .tool_exec_end => |payload| {
@@ -427,7 +450,7 @@ const StreamSinkCtx = struct {
                         self.endDanglingToolLine();
                     } else {
                         const state: ToolLineState = if (payload.is_error) .err else .done;
-                        renderToolLine(self.writer, active.label, state, true);
+                        renderToolLine(self.writer, self.current_theme, active.label, state, true);
                         self.clearActiveToolState();
                         self.last_output_block = .tool;
                         return;
@@ -436,13 +459,20 @@ const StreamSinkCtx = struct {
 
                 const fallback_label = formatToolLabel(
                     self.allocator,
+                    self.current_theme,
                     payload.name,
                     "{}",
                     max_tool_args_chars,
                 ) catch return;
                 defer self.allocator.free(fallback_label);
                 const fallback_state: ToolLineState = if (payload.is_error) .err else .done;
-                renderToolLine(self.writer, fallback_label, fallback_state, true);
+                renderToolLine(
+                    self.writer,
+                    self.current_theme,
+                    fallback_label,
+                    fallback_state,
+                    true,
+                );
                 self.last_output_block = .tool;
             },
             .turn_end => |payload| {
@@ -455,20 +485,23 @@ const StreamSinkCtx = struct {
                 self.endDanglingToolLine();
                 var buf: [160]u8 = undefined;
                 const msg = std.fmt.bufPrint(&buf, "{s}tokens: {d} in / {d} out{s}\n", .{
-                    ansi.dim,
+                    ansi.dimCode(self.current_theme),
                     payload.total_usage.input,
                     payload.total_usage.output,
-                    ansi.reset,
+                    ansi.resetCode(self.current_theme),
                 }) catch return;
                 self.writer.writeAll(msg) catch {};
             },
             .err => |message| {
                 self.flushMarkdown();
                 self.endDanglingToolLine();
-                self.writer.writeAll(ansi.Color.red.fgCode()) catch {};
+                var fg_buf: [24]u8 = undefined;
+                self.writer.writeAll(
+                    ansi.fgPrefix(&fg_buf, self.current_theme, self.current_theme.palette.tool_error),
+                ) catch {};
                 self.writer.writeAll("error: ") catch {};
                 self.writer.writeAll(message) catch {};
-                self.writer.writeAll(ansi.reset) catch {};
+                self.writer.writeAll(ansi.resetCode(self.current_theme)) catch {};
                 self.writer.writeAll("\n") catch {};
             },
             else => {},
@@ -478,6 +511,7 @@ const StreamSinkCtx = struct {
 
 fn formatToolLabel(
     allocator: std.mem.Allocator,
+    current_theme: theme.Theme,
     tool_name: []const u8,
     arguments: []const u8,
     max_args_len: usize,
@@ -485,17 +519,20 @@ fn formatToolLabel(
     const args = try summarizeToolArguments(allocator, tool_name, arguments, max_args_len);
     defer allocator.free(args);
     const display_name = toolDisplayName(tool_name);
+    var fg_buf: [24]u8 = undefined;
+    const label_color = ansi.fgPrefix(&fg_buf, current_theme, current_theme.palette.link);
+    const reset_code = ansi.resetCode(current_theme);
     if (std.mem.eql(u8, args, "{}")) {
         return std.fmt.allocPrint(
             allocator,
             "• {s}{s}{s}",
-            .{ tool_name_orange, display_name, ansi.reset },
+            .{ label_color, display_name, reset_code },
         );
     }
     return std.fmt.allocPrint(
         allocator,
         "• {s}{s}{s} {s}",
-        .{ tool_name_orange, display_name, ansi.reset, args },
+        .{ label_color, display_name, reset_code, args },
     );
 }
 
@@ -662,25 +699,35 @@ fn summarizeToolText(allocator: std.mem.Allocator, text: []const u8, max_len: us
 
 fn renderToolLine(
     writer: std.fs.File,
+    current_theme: theme.Theme,
     label: []const u8,
     state: ToolLineState,
     newline: bool,
 ) void {
     const ToolStyle = struct {
-        color: []const u8,
+        color_value: theme.ColorValue,
         icon: []const u8,
     };
     const style: ToolStyle = switch (state) {
-        .running => .{ .color = ansi.Color.yellow.fgCode(), .icon = "⟳" },
-        .done => .{ .color = ansi.Color.green.fgCode(), .icon = "✓" },
-        .err => .{ .color = ansi.Color.red.fgCode(), .icon = "✗" },
+        .running => .{ .color_value = current_theme.palette.tool_running, .icon = "⟳" },
+        .done => .{ .color_value = current_theme.palette.tool_success, .icon = "✓" },
+        .err => .{ .color_value = current_theme.palette.tool_error, .icon = "✗" },
     };
+    if (!ansi.isEnabled(current_theme)) {
+        writer.writeAll(label) catch {};
+        writer.writeAll(" ") catch {};
+        writer.writeAll(style.icon) catch {};
+        if (newline) writer.writeAll("\n") catch {};
+        return;
+    }
+
+    var fg_buf: [24]u8 = undefined;
     writer.writeAll("\r\x1b[2K") catch {};
     writer.writeAll(label) catch {};
     writer.writeAll(" ") catch {};
-    writer.writeAll(style.color) catch {};
+    writer.writeAll(ansi.fgPrefix(&fg_buf, current_theme, style.color_value)) catch {};
     writer.writeAll(style.icon) catch {};
-    writer.writeAll(ansi.reset) catch {};
+    writer.writeAll(ansi.resetCode(current_theme)) catch {};
     if (newline) writer.writeAll("\n") catch {};
 }
 
@@ -711,6 +758,17 @@ fn isFastPathMarkdownDelta(delta: []const u8) bool {
         if (byte == 0x1b) return false;
     }
     return true;
+}
+
+fn hasOpenFencedCodeBlock(text: []const u8) bool {
+    var in_code_block = false;
+    var iterator = std.mem.splitScalar(u8, text, '\n');
+    while (iterator.next()) |line| {
+        if (std.mem.startsWith(u8, line, "```")) {
+            in_code_block = !in_code_block;
+        }
+    }
+    return in_code_block;
 }
 
 fn lineHasAnsi(line: []const u8) bool {
@@ -840,11 +898,12 @@ fn runLineBuffered(
     stdout_file: std.fs.File,
     stdin_file: std.fs.File,
     event_loop: *runtime.EventLoop,
+    current_theme: theme.Theme,
 ) !void {
     var stdin_buffer: [4096]u8 = undefined;
     var reader = stdin_file.readerStreaming(&stdin_buffer);
 
-    var sink_ctx = StreamSinkCtx.init(allocator, stdout_file, event_loop);
+    var sink_ctx = StreamSinkCtx.init(allocator, stdout_file, event_loop, current_theme);
     defer sink_ctx.deinit();
 
     const sink: agent_types.AgentEventSink = .{
@@ -939,6 +998,11 @@ test "fast path markdown delta filter rejects markdown control bytes" {
     try std.testing.expect(!isFastPathMarkdownDelta("line\rbreak"));
 }
 
+test "open fenced code block is detected" {
+    try std.testing.expect(hasOpenFencedCodeBlock("```zig\nconst x = 1\n"));
+    try std.testing.expect(!hasOpenFencedCodeBlock("```zig\nconst x = 1\n```"));
+}
+
 test "append delta to rendered lines wraps and appends" {
     const allocator = std.testing.allocator;
     const previous = [_][]const u8{" hello"};
@@ -983,21 +1047,24 @@ test "tool summary compacts whitespace and truncates" {
 
 test "tool label renders human-readable args" {
     const allocator = std.testing.allocator;
+    const current_theme = theme.themeFor(.ansi16, .dark);
 
     const read_label = try formatToolLabel(
         allocator,
+        current_theme,
         "read",
         "{\"path\":\"AGENTS.md\"}",
         120,
     );
     defer allocator.free(read_label);
     try std.testing.expect(std.mem.indexOf(u8, read_label, "• ") == 0);
-    try std.testing.expect(std.mem.indexOf(u8, read_label, tool_name_orange) != null);
+    try std.testing.expect(std.mem.indexOf(u8, read_label, "\x1b[") != null);
     try std.testing.expect(std.mem.indexOf(u8, read_label, "Read") != null);
     try std.testing.expect(std.mem.indexOf(u8, read_label, "AGENTS.md") != null);
 
     const bash_label = try formatToolLabel(
         allocator,
+        current_theme,
         "bash",
         "{\"command\":\"echo hi\"}",
         120,
@@ -1009,6 +1076,7 @@ test "tool label renders human-readable args" {
 
 test "tool execution status rewrites same line with args" {
     const allocator = std.testing.allocator;
+    const current_theme = theme.themeFor(.ansi16, .dark);
 
     var event_loop: runtime.EventLoop = undefined;
     try event_loop.init(allocator);
@@ -1020,7 +1088,7 @@ test "tool execution status rewrites same line with args" {
     const file = try tmp.dir.createFile("stream_sink_tool_line", .{ .read = true });
     defer file.close();
 
-    var sink = StreamSinkCtx.init(allocator, file, &event_loop);
+    var sink = StreamSinkCtx.init(allocator, file, &event_loop, current_theme);
     defer sink.deinit();
 
     StreamSinkCtx.onEvent(&sink, .{
@@ -1045,7 +1113,7 @@ test "tool execution status rewrites same line with args" {
     defer allocator.free(output);
 
     try std.testing.expect(std.mem.indexOf(u8, output, "• ") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output, tool_name_orange) != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "\x1b[") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "Bash") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "echo hi") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "exit=0") == null);
@@ -1056,6 +1124,7 @@ test "tool execution status rewrites same line with args" {
 
 test "tool output inserts blank line between tool blocks" {
     const allocator = std.testing.allocator;
+    const current_theme = theme.themeFor(.ansi16, .dark);
 
     var event_loop: runtime.EventLoop = undefined;
     try event_loop.init(allocator);
@@ -1067,7 +1136,7 @@ test "tool output inserts blank line between tool blocks" {
     const file = try tmp.dir.createFile("stream_sink_tool_spacing", .{ .read = true });
     defer file.close();
 
-    var sink = StreamSinkCtx.init(allocator, file, &event_loop);
+    var sink = StreamSinkCtx.init(allocator, file, &event_loop, current_theme);
     defer sink.deinit();
 
     StreamSinkCtx.onEvent(&sink, .{
@@ -1111,6 +1180,7 @@ test "tool output inserts blank line between tool blocks" {
 
 test "markdown output inserts blank line after tool block" {
     const allocator = std.testing.allocator;
+    const current_theme = theme.themeFor(.ansi16, .dark);
 
     var event_loop: runtime.EventLoop = undefined;
     try event_loop.init(allocator);
@@ -1122,7 +1192,7 @@ test "markdown output inserts blank line after tool block" {
     const file = try tmp.dir.createFile("stream_sink_markdown_spacing", .{ .read = true });
     defer file.close();
 
-    var sink = StreamSinkCtx.init(allocator, file, &event_loop);
+    var sink = StreamSinkCtx.init(allocator, file, &event_loop, current_theme);
     defer sink.deinit();
 
     StreamSinkCtx.onEvent(&sink, .{
@@ -1152,8 +1222,38 @@ test "markdown output inserts blank line after tool block" {
     try std.testing.expect(std.mem.indexOf(u8, output, "hello") != null);
 }
 
+test "streaming code block is highlighted before closing fence" {
+    const allocator = std.testing.allocator;
+    const current_theme = theme.themeFor(.ansi256, .dark);
+
+    var event_loop: runtime.EventLoop = undefined;
+    try event_loop.init(allocator);
+    defer event_loop.deinit();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const file = try tmp.dir.createFile("stream_sink_code_fence", .{ .read = true });
+    defer file.close();
+
+    var sink = StreamSinkCtx.init(allocator, file, &event_loop, current_theme);
+    defer sink.deinit();
+
+    StreamSinkCtx.onEvent(&sink, .{ .text_delta = "```zig\n" });
+    StreamSinkCtx.onEvent(&sink, .{ .text_delta = "const x: u32 = 1;\n" });
+    sink.flushMarkdown();
+
+    try file.seekTo(0);
+    const stat = try file.stat();
+    const output = try file.readToEndAlloc(allocator, @intCast(stat.size));
+    defer allocator.free(output);
+
+    try std.testing.expect(std.mem.indexOf(u8, output, "\x1b[38;5;") != null);
+}
+
 test "throttled text delta flushes at frame deadline" {
     const allocator = std.testing.allocator;
+    const current_theme = theme.themeFor(.ansi16, .dark);
 
     var event_loop: runtime.EventLoop = undefined;
     try event_loop.init(allocator);
@@ -1165,7 +1265,7 @@ test "throttled text delta flushes at frame deadline" {
     const file = try tmp.dir.createFile("stream_sink_deadline", .{ .read = true });
     defer file.close();
 
-    var sink = StreamSinkCtx.init(allocator, file, &event_loop);
+    var sink = StreamSinkCtx.init(allocator, file, &event_loop, current_theme);
     defer sink.deinit();
 
     sink.last_render_ns = std.time.nanoTimestamp();
@@ -1176,6 +1276,7 @@ test "throttled text delta flushes at frame deadline" {
 
 test "append-only markdown path updates renderer backbuffer" {
     const allocator = std.testing.allocator;
+    const current_theme = theme.themeFor(.ansi16, .dark);
 
     var event_loop: runtime.EventLoop = undefined;
     try event_loop.init(allocator);
@@ -1187,7 +1288,7 @@ test "append-only markdown path updates renderer backbuffer" {
     const file = try tmp.dir.createFile("stream_sink_append", .{ .read = true });
     defer file.close();
 
-    var sink = StreamSinkCtx.init(allocator, file, &event_loop);
+    var sink = StreamSinkCtx.init(allocator, file, &event_loop, current_theme);
     defer sink.deinit();
 
     sink.text_buf.appendSlice(allocator, "hello") catch return error.OutOfMemory;
@@ -1204,6 +1305,7 @@ test "append-only markdown path updates renderer backbuffer" {
 
 test "turn_end flushes markdown and usage prints once on agent_end" {
     const allocator = std.testing.allocator;
+    const current_theme = theme.themeFor(.ansi16, .dark);
 
     var event_loop: runtime.EventLoop = undefined;
     try event_loop.init(allocator);
@@ -1215,7 +1317,7 @@ test "turn_end flushes markdown and usage prints once on agent_end" {
     const file = try tmp.dir.createFile("stream_sink_out", .{ .read = true });
     defer file.close();
 
-    var sink = StreamSinkCtx.init(allocator, file, &event_loop);
+    var sink = StreamSinkCtx.init(allocator, file, &event_loop, current_theme);
     defer sink.deinit();
 
     sink.last_render_ns = std.time.nanoTimestamp() + MIN_RENDER_INTERVAL_NS;
