@@ -440,7 +440,7 @@ src/ai/
 ### Compatibility and Migration
 
 - 完全新建模块，不影响现有代码
-- 现有 `src/api.zig` 在 orbit-ai 就绪后废弃
+- 历史上的 `src/api.zig` 已移除；orbit-ai 直接承担 provider 与传输层职责
 
 ## Testing
 

@@ -3,6 +3,7 @@ const log = std.log.scoped(.ai_json);
 
 pub const Error = error{
     InvalidJsonFragment,
+    OutOfMemory,
 };
 
 pub fn appendJsonString(

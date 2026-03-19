@@ -1,18 +1,18 @@
 # Orbit
 
-Orbit is a standalone code agent built in Zig with a Vaxis TUI.
+Orbit is a standalone code agent built in Zig.
 
 ## Vision
 
 Orbit is a true autonomous coding assistant, not a frontend for another service. It provides:
 - Direct file system operations
 - Code execution and testing
-- Interactive terminal UI for agent collaboration
+- Interactive CLI and headless execution modes
 - Fast, safe, and reliable operation
 
 ## Status
 
-Currently in early development. The codebase contains a working Vaxis TUI prototype from the previous opencode-zig project. We are actively refactoring toward the agent architecture.
+Currently in early development. The legacy opencode-zig prototype has been removed. The active codebase is organized around the `ai`, `agent`, and `cli` layers.
 
 ## Quick Start
 
@@ -28,31 +28,27 @@ zig build test
 
 Format code:
 ```bash
-zig fmt src/*.zig build.zig
+zig fmt src/ai/*.zig src/agent/*.zig src/cli/*.zig src/main.zig src/tests.zig build.zig
 ```
 
 ## Project Structure
 
 - `src/` - Source code
-  - `main.zig` - Entry point and event loop
-  - `runtime/` - Event routing and renderer abstraction
-  - `ui/` - Terminal UI components
-  - `state.zig` - Application state management
-  - `input/` - Keyboard input handling
-  - `app_controller.zig` - Application logic coordination
+  - `main.zig` - Process entry point
+  - `cli/` - CLI entry, config, sessions, tools, headless mode
+  - `agent/` - Agent loop and tool execution bridge
+  - `ai/` - Models, providers, transport, message context
 - `references/` - Read-only reference projects for learning
 - `AGENTS.md` - Primary development guide (read this first)
 - `STYLE.md` - Coding style and safety guidelines
-- `LEGACY_ARCH.md` - Documentation of existing prototype code
 
 ## Development Workflow
 
 1. **Always read `AGENTS.md` first** for any task
 2. Read `STYLE.md` when writing or refactoring Zig code
-3. Read `LEGACY_ARCH.md` when working with existing prototype code
-4. Consult `references/AGENTS.md` for architecture patterns and examples
-5. Run `zig fmt` before committing
-6. Add tests for state transitions and bug fixes
+3. Consult `references/AGENTS.md` for architecture patterns and examples
+4. Run `zig fmt` before committing
+5. Add tests for agent, AI, CLI, and persistence changes
 
 ## Key Principles
 

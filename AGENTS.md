@@ -3,12 +3,12 @@
 This file is the operating contract for all work in the Orbit project.
 
 ## Project Vision
-Orbit is a true code agent built in Zig with a Vaxis TUI.
-It is not a frontend for another service—it is a standalone autonomous coding assistant.
+Orbit is a true code agent built in Zig.
+It is not a frontend for another service. It is a standalone autonomous coding assistant.
 
 ## Goals
 
-- Build a reliable, fast, and safe code agent with Zig + Vaxis TUI.
+- Build a reliable, fast, and safe code agent with Zig.
 - Keep architecture explicit, bounded, and testable.
 - Follow `STYLE.md` as the primary style and safety baseline.
 - Maintain zero technical debt policy.
@@ -23,37 +23,29 @@ It is not a frontend for another service—it is a standalone autonomous coding 
 - Read `README.md` when:
   - running the app/tests for the first time in a session,
   - checking current feature scope or runtime commands.
-- Read `LEGACY_ARCH.md` when:
-  - understanding existing code structure from the opencode-zig prototype,
-  - planning refactors of legacy modules.
 
 ## Core Commands
 
-- Run TUI:
+- Run CLI:
   - `zig build run`
 - Run tests:
   - `zig build test`
 - Build only:
   - `zig build`
 - Format:
-  - `zig fmt src/*.zig build.zig`
+  - `zig fmt src/ai/*.zig src/agent/*.zig src/cli/*.zig src/main.zig src/tests.zig build.zig`
 
 ## Architecture Boundaries
 
 - `src/main.zig`:
-  - Process lifecycle, event loop wiring, top-level orchestration only.
-- `src/ui/`:
-  - Rendering and layout only.
-  - No network I/O, no business logic.
-- `src/state.zig`:
-  - State model and transitions.
-  - No terminal I/O and no network I/O.
-- `src/runtime/`:
-  - Event routing, renderer abstraction, core runtime infrastructure.
-- `src/input/`:
-  - Keyboard input handling and keymaps.
-- `src/app_controller.zig`:
-  - Application-level command dispatch and coordination.
+  - Process lifecycle only. Initialize allocator and call `cli.run()`.
+- `src/cli/`:
+  - CLI entry, config loading, context file loading, session persistence, local tool wiring.
+  - No provider protocol parsing and no agent loop internals.
+- `src/agent/`:
+  - Agent loop, tool dispatch, event emission, message ownership.
+- `src/ai/`:
+  - Provider adapters, HTTP/SSE transport, model registry, message normalization.
 
 When adding modules, prefer domain folders over utility buckets.
 
@@ -66,6 +58,38 @@ When adding modules, prefer domain folders over utility buckets.
 - Avoid hidden allocations in hot loops (input/render/event paths).
 - Keep line length at or below 100 columns.
 - Always run `zig fmt` for touched Zig files.
+
+## Memory Safety Rules
+
+Zig has no garbage collector. Every allocation is a contract. Violating it means silent leaks
+or use-after-free. Treat every `alloc`/`dupe`/`create` as a critical section.
+
+- **`errdefer` only fires on error return, not on normal return from a `catch` block.**
+  This is the single most common memory leak pattern in this codebase. If you `catch` and
+  do a normal `return`, all preceding `errdefer` statements are skipped.
+  ```zig
+  // BUG: id leaks if name allocation fails.
+  const id = try allocator.dupe(u8, src_id);
+  errdefer allocator.free(id);
+  const name = allocator.dupe(u8, src_name) catch {
+      log("OOM");
+      return;       // ← normal return, errdefer for id does NOT fire
+  };
+  ```
+  Fix: either propagate the error (`try`), or manually free in each `catch` block.
+
+- **Pair every allocation with a clear owner and a deallocation path.**
+  Before writing an `alloc`/`dupe`, answer: who frees this, and when? If ownership transfers
+  (e.g. moving an ArrayList's buffer to another struct), document the transfer with a comment
+  and null/reset the source immediately.
+
+- **Do not duplicate free logic across modules.**
+  If `ai/context.zig` already exports `freePart` / `freeMessages`, import and reuse them.
+  Duplicated free functions diverge when types evolve, causing leaks or double-frees.
+
+- **Test allocations with `std.testing.allocator`.**
+  It detects leaks and use-after-free at test time. Every test that allocates must use it
+  and must `defer deinit()` all owned resources.
 
 ## Testing Rules
 

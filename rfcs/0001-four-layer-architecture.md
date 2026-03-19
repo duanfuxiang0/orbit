@@ -406,22 +406,22 @@ const Session = struct {
 ### Application Flow and Runtime
 
 - [x] Process lifecycle (`src/main.zig`)
-- [x] Event definitions and routing (`src/runtime/`)
+- [x] Event definitions and routing
 - [x] Renderer abstraction
-- [x] App-level coordination (`src/app_controller.zig`)
+- [x] App-level coordination
 - [x] Background work, subprocesses, or async task handling
 
 ### UI and Interaction
 
-- [x] Screen layout or rendering (`src/ui/` or legacy `src/ui.zig`)
-- [x] Keyboard input or keymaps (`src/input/`)
+- [x] Screen layout or rendering
+- [x] Keyboard input or keymaps
 - [x] Navigation, focus, or modal flows
 - [x] Streaming output or incremental updates
 - [x] Accessibility or readability in terminal environments
 
 ### State and Domain Model
 
-- [x] State shape or ownership (`src/state.zig`)
+- [x] State shape or ownership
 - [x] State transitions or invariants
 - [x] Session, message, or task model
 - [x] Persistence, serialization, or replay behavior
@@ -467,9 +467,9 @@ const Session = struct {
 
 ### Compatibility and Migration
 
-- 现有 opencode-zig 代码将被逐步替换，不做兼容
-- 现有 `src/ui.zig`、`src/api.zig`、`src/state.zig` 将被新的分层模块取代
-- `src/runtime/` 的事件路由概念保留，但重新实现
+- 旧的 opencode-zig 代码已从当前仓库移除，不做兼容
+- 历史上的 `src/ui.zig`、`src/api.zig`、`src/state.zig` 已被新的分层模块替代
+- 历史上的 `src/runtime/` 事件路由概念只作为设计参考，不再作为当前代码结构存在
 
 ## Testing
 

@@ -2,6 +2,10 @@
 
    Status: Draft
 
+   Note:
+   先前仓库里短暂存在过一版实验性的 `src/tui/` 实现，但已在遗留代码清理时移除。
+   本 RFC 仍然描述未来可能重建的 TUI 设计，不代表当前仓库里已有这些模块。
+
    Authors:
 
    * Orbit Team

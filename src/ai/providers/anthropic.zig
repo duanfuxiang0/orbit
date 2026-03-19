@@ -9,6 +9,10 @@ const types = @import("../types.zig");
 pub const Header = provider_mod.Header;
 pub const Transport = provider_mod.Transport;
 
+const default_messages_url = "https://api.anthropic.com/v1/messages";
+const zhipu_origin = "https://open.bigmodel.cn";
+const zhipu_messages_url = "https://open.bigmodel.cn/api/anthropic/v1/messages";
+
 pub const AnthropicProvider = struct {
     allocator: std.mem.Allocator,
     api_key: []u8,
@@ -27,7 +31,7 @@ pub const AnthropicProvider = struct {
         return .{
             .allocator = allocator,
             .api_key = try allocator.dupe(u8, api_key),
-            .base_url = try allocator.dupe(u8, base_url orelse "https://api.anthropic.com/v1/messages"),
+            .base_url = try resolveMessagesUrl(allocator, base_url),
             .transport = transport,
         };
     }
@@ -151,6 +155,24 @@ const vtable: provider_mod.Provider.VTable = .{
     .name = AnthropicProvider.nameImpl,
     .deinit = AnthropicProvider.deinitImpl,
 };
+
+fn resolveMessagesUrl(allocator: std.mem.Allocator, base_url: ?[]const u8) ![]u8 {
+    const raw = base_url orelse return allocator.dupe(u8, default_messages_url);
+    std.debug.assert(raw.len > 0);
+
+    if (std.mem.endsWith(u8, raw, "/v1/messages")) return allocator.dupe(u8, raw);
+    if (isZhipuOrigin(raw)) return allocator.dupe(u8, zhipu_messages_url);
+    if (std.mem.endsWith(u8, raw, "/")) {
+        return std.fmt.allocPrint(allocator, "{s}v1/messages", .{raw});
+    }
+    return std.fmt.allocPrint(allocator, "{s}/v1/messages", .{raw});
+}
+
+fn isZhipuOrigin(raw: []const u8) bool {
+    if (std.mem.eql(u8, raw, zhipu_origin)) return true;
+    if (std.mem.eql(u8, raw, zhipu_origin ++ "/")) return true;
+    return false;
+}
 
 const ToolSlot = struct {
     index: u32,
@@ -538,6 +560,33 @@ test "build anthropic request body keeps native thinking blocks" {
     try std.testing.expect(std.mem.indexOf(u8, body, "\"type\":\"thinking\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"thinking\":\"trace\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"signature\":\"sig_abc\"") != null);
+}
+
+test "anthropic resolves base url roots and endpoints" {
+    const allocator = std.testing.allocator;
+
+    const default_url = try resolveMessagesUrl(allocator, null);
+    defer allocator.free(default_url);
+    try std.testing.expectEqualStrings(default_messages_url, default_url);
+
+    const official_url = try resolveMessagesUrl(allocator, "https://api.anthropic.com");
+    defer allocator.free(official_url);
+    try std.testing.expectEqualStrings(default_messages_url, official_url);
+
+    const zhipu_url = try resolveMessagesUrl(allocator, "https://open.bigmodel.cn");
+    defer allocator.free(zhipu_url);
+    try std.testing.expectEqualStrings(zhipu_messages_url, zhipu_url);
+
+    const compatible_url = try resolveMessagesUrl(
+        allocator,
+        "https://open.bigmodel.cn/api/anthropic",
+    );
+    defer allocator.free(compatible_url);
+    try std.testing.expectEqualStrings(zhipu_messages_url, compatible_url);
+
+    const endpoint_url = try resolveMessagesUrl(allocator, zhipu_messages_url);
+    defer allocator.free(endpoint_url);
+    try std.testing.expectEqualStrings(zhipu_messages_url, endpoint_url);
 }
 
 test "anthropic delta payload remains valid after parser teardown" {
