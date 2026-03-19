@@ -5,6 +5,8 @@ pub const Config = struct {
     anthropic_api_key: ?[]const u8,
     anthropic_base_url: ?[]const u8,
     openai_api_key: ?[]const u8,
+    zhipu_api_key: ?[]const u8,
+    zhipu_base_url: ?[]const u8,
     sessions_dir: []const u8,
     verbose: bool,
 
@@ -13,6 +15,8 @@ pub const Config = struct {
         if (self.anthropic_api_key) |value| allocator.free(value);
         if (self.anthropic_base_url) |value| allocator.free(value);
         if (self.openai_api_key) |value| allocator.free(value);
+        if (self.zhipu_api_key) |value| allocator.free(value);
+        if (self.zhipu_base_url) |value| allocator.free(value);
         allocator.free(self.sessions_dir);
         self.* = undefined;
     }
@@ -23,6 +27,8 @@ const RawConfig = struct {
     anthropic_api_key: ?[]const u8 = null,
     anthropic_base_url: ?[]const u8 = null,
     openai_api_key: ?[]const u8 = null,
+    zhipu_api_key: ?[]const u8 = null,
+    zhipu_base_url: ?[]const u8 = null,
     sessions_dir: ?[]const u8 = null,
     verbose: ?bool = null,
 
@@ -31,6 +37,8 @@ const RawConfig = struct {
         if (self.anthropic_api_key) |value| allocator.free(value);
         if (self.anthropic_base_url) |value| allocator.free(value);
         if (self.openai_api_key) |value| allocator.free(value);
+        if (self.zhipu_api_key) |value| allocator.free(value);
+        if (self.zhipu_base_url) |value| allocator.free(value);
         if (self.sessions_dir) |value| allocator.free(value);
         self.* = undefined;
     }
@@ -41,6 +49,8 @@ pub const EnvOverrides = struct {
     anthropic_api_key: ?[]const u8 = null,
     anthropic_base_url: ?[]const u8 = null,
     openai_api_key: ?[]const u8 = null,
+    zhipu_api_key: ?[]const u8 = null,
+    zhipu_base_url: ?[]const u8 = null,
     orbit_sessions_dir: ?[]const u8 = null,
     orbit_verbose: ?bool = null,
 
@@ -49,6 +59,8 @@ pub const EnvOverrides = struct {
         if (self.anthropic_api_key) |value| allocator.free(value);
         if (self.anthropic_base_url) |value| allocator.free(value);
         if (self.openai_api_key) |value| allocator.free(value);
+        if (self.zhipu_api_key) |value| allocator.free(value);
+        if (self.zhipu_base_url) |value| allocator.free(value);
         if (self.orbit_sessions_dir) |value| allocator.free(value);
         self.* = undefined;
     }
@@ -132,6 +144,14 @@ fn buildConfig(
             allocator,
             env.openai_api_key orelse raw.openai_api_key,
         ),
+        .zhipu_api_key = try dupOptional(
+            allocator,
+            env.zhipu_api_key orelse raw.zhipu_api_key,
+        ),
+        .zhipu_base_url = try dupOptional(
+            allocator,
+            env.zhipu_base_url orelse raw.zhipu_base_url,
+        ),
         .sessions_dir = try expandHomeDir(allocator, home_dir, sessions_dir_value),
         .verbose = verbose_value,
     };
@@ -174,6 +194,8 @@ fn loadObjectConfig(
     try assignJsonString(allocator, &result.anthropic_api_key, value, "anthropic_api_key");
     try assignJsonString(allocator, &result.anthropic_base_url, value, "anthropic_base_url");
     try assignJsonString(allocator, &result.openai_api_key, value, "openai_api_key");
+    try assignJsonString(allocator, &result.zhipu_api_key, value, "zhipu_api_key");
+    try assignJsonString(allocator, &result.zhipu_base_url, value, "zhipu_base_url");
     try assignJsonString(allocator, &result.sessions_dir, value, "sessions_dir");
 
     if (value.object.get("verbose")) |raw_verbose| {
@@ -259,6 +281,14 @@ fn parseTomlLine(
         result.openai_api_key = parsed;
         return;
     }
+    if (std.mem.eql(u8, key, "zhipu_api_key")) {
+        result.zhipu_api_key = parsed;
+        return;
+    }
+    if (std.mem.eql(u8, key, "zhipu_base_url")) {
+        result.zhipu_base_url = parsed;
+        return;
+    }
     if (std.mem.eql(u8, key, "sessions_dir")) {
         result.sessions_dir = parsed;
         return;
@@ -286,6 +316,8 @@ fn loadEnvOverrides(allocator: std.mem.Allocator) !EnvOverrides {
         .anthropic_api_key = getEnvOwned(allocator, "ANTHROPIC_API_KEY"),
         .anthropic_base_url = getEnvOwned(allocator, "ANTHROPIC_BASE_URL"),
         .openai_api_key = getEnvOwned(allocator, "OPENAI_API_KEY"),
+        .zhipu_api_key = getEnvOwned(allocator, "ZHIPU_API_KEY"),
+        .zhipu_base_url = getEnvOwned(allocator, "ZHIPU_BASE_URL"),
         .orbit_sessions_dir = getEnvOwned(allocator, "ORBIT_SESSIONS_DIR"),
         .orbit_verbose = try parseOptionalBoolEnv(allocator, "ORBIT_VERBOSE"),
     };
@@ -362,6 +394,7 @@ test "config accepts empty json object" {
 
     try std.testing.expect(raw.default_model == null);
     try std.testing.expect(raw.anthropic_base_url == null);
+    try std.testing.expect(raw.zhipu_base_url == null);
     try std.testing.expect(raw.sessions_dir == null);
 }
 
@@ -377,6 +410,7 @@ test "env overrides config values" {
         \\  "llm": {
         \\    "default_model": "gpt-4o",
         \\    "anthropic_base_url": "https://config.example/api/anthropic",
+        \\    "zhipu_base_url": "https://config.example/api/paas/v4",
         \\    "sessions_dir": "~/sessions-a",
         \\    "verbose": false
         \\  }
@@ -387,6 +421,7 @@ test "env overrides config values" {
     var env: EnvOverrides = .{
         .orbit_model = try allocator.dupe(u8, "claude-sonnet-4-20250514"),
         .anthropic_base_url = try allocator.dupe(u8, "https://env.example"),
+        .zhipu_base_url = try allocator.dupe(u8, "https://env.zhipu.example/api/paas/v4"),
         .orbit_sessions_dir = try allocator.dupe(u8, "~/sessions-b"),
         .orbit_verbose = true,
     };
@@ -400,6 +435,10 @@ test "env overrides config values" {
 
     try std.testing.expectEqualStrings("claude-sonnet-4-20250514", config.default_model);
     try std.testing.expectEqualStrings("https://env.example", config.anthropic_base_url.?);
+    try std.testing.expectEqualStrings(
+        "https://env.zhipu.example/api/paas/v4",
+        config.zhipu_base_url.?,
+    );
     try std.testing.expectEqualStrings("/tmp/home/sessions-b", config.sessions_dir);
     try std.testing.expect(config.verbose);
 }
@@ -418,6 +457,7 @@ test "config parses toml subset" {
         \\[llm]
         \\default_model = "gpt-4o"
         \\anthropic_base_url = "https://open.bigmodel.cn"
+        \\zhipu_base_url = "https://open.bigmodel.cn/api/paas/v4"
         \\sessions_dir = "~/.orbit/custom"
         \\verbose = true
     );
@@ -425,6 +465,10 @@ test "config parses toml subset" {
 
     try std.testing.expectEqualStrings("gpt-4o", raw.default_model.?);
     try std.testing.expectEqualStrings("https://open.bigmodel.cn", raw.anthropic_base_url.?);
+    try std.testing.expectEqualStrings(
+        "https://open.bigmodel.cn/api/paas/v4",
+        raw.zhipu_base_url.?,
+    );
     try std.testing.expectEqualStrings("~/.orbit/custom", raw.sessions_dir.?);
     try std.testing.expect(raw.verbose.?);
 }

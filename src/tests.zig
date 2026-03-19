@@ -8,5 +8,6 @@ test {
     _ = @import("cli/headless.zig");
     _ = @import("cli/interactive.zig");
     _ = @import("cli/root.zig");
+    _ = @import("runtime/root.zig");
     _ = @import("tui/root.zig");
 }

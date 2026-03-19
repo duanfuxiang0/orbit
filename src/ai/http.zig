@@ -367,10 +367,11 @@ const HttpConnection = struct {
                 continue;
             }
 
-            if (!(try self.waitForReadable())) {
-                if (copied > 0) return copied;
-                return 0;
-            }
+            // Return immediately when we already have data. Waiting for
+            // more would stall SSE streaming by up to the poll timeout.
+            if (copied > 0) return copied;
+
+            if (!(try self.waitForReadable())) return 0;
 
             const bytes = reader.take(1) catch |err| switch (err) {
                 error.EndOfStream => return copied,

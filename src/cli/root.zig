@@ -199,6 +199,8 @@ fn resolveModel(
         .anthropic_messages
     else if (std.mem.eql(u8, provider, "openai"))
         .openai_completions
+    else if (std.mem.eql(u8, provider, "zhipu"))
+        .openai_completions
     else
         return error.UnknownProvider;
 
@@ -243,6 +245,11 @@ const ProviderBinding = union(enum) {
         provider: ai.providers.openai.OpenAIProvider,
         model: ai.Model,
     },
+    zhipu: struct {
+        transport: *ai.http.StdHttpTransport,
+        provider: ai.providers.zhipu.ZhipuProvider,
+        model: ai.Model,
+    },
 
     fn init(
         allocator: std.mem.Allocator,
@@ -285,6 +292,22 @@ const ProviderBinding = union(enum) {
                 },
             };
         }
+        if (std.mem.eql(u8, model.provider, "zhipu")) {
+            const api_key = config.zhipu_api_key orelse return error.MissingZhipuApiKey;
+            const base_url = config.zhipu_base_url orelse model.base_url;
+            return .{
+                .zhipu = .{
+                    .transport = transport,
+                    .provider = try ai.providers.zhipu.ZhipuProvider.init(
+                        allocator,
+                        api_key,
+                        base_url,
+                        transport.asTransport(),
+                    ),
+                    .model = model,
+                },
+            };
+        }
         allocator.destroy(transport);
         return error.UnknownProvider;
     }
@@ -301,6 +324,11 @@ const ProviderBinding = union(enum) {
                 binding.provider.deinit();
                 allocator.destroy(binding.transport);
             },
+            .zhipu => |*binding| {
+                const allocator = binding.provider.allocator;
+                binding.provider.deinit();
+                allocator.destroy(binding.transport);
+            },
         }
         self.* = undefined;
     }
@@ -309,6 +337,7 @@ const ProviderBinding = union(enum) {
         return switch (self.*) {
             .anthropic => |*binding| binding.provider.asProvider(),
             .openai => |*binding| binding.provider.asProvider(),
+            .zhipu => |*binding| binding.provider.asProvider(),
         };
     }
 
@@ -316,6 +345,7 @@ const ProviderBinding = union(enum) {
         return switch (self.*) {
             .anthropic => |binding| binding.model,
             .openai => |binding| binding.model,
+            .zhipu => |binding| binding.model,
         };
     }
 };
@@ -367,6 +397,18 @@ test "resolve model keeps dynamic qualified ids" {
 
     try std.testing.expectEqualStrings("glm-5", resolved.model.id);
     try std.testing.expectEqualStrings("anthropic", resolved.model.provider);
+    try std.testing.expect(resolved.owned_id != null);
+    try std.testing.expect(resolved.owned_provider != null);
+}
+
+test "resolve model keeps dynamic qualified zhipu ids" {
+    const allocator = std.testing.allocator;
+    var resolved = try resolveModel(allocator, "zhipu/glm-4.5", null);
+    defer resolved.deinit(allocator);
+
+    try std.testing.expectEqualStrings("glm-4.5", resolved.model.id);
+    try std.testing.expectEqualStrings("zhipu", resolved.model.provider);
+    try std.testing.expectEqual(ai.ApiProtocol.openai_completions, resolved.model.protocol);
     try std.testing.expect(resolved.owned_id != null);
     try std.testing.expect(resolved.owned_provider != null);
 }

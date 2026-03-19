@@ -10,6 +10,7 @@ pub const json_util = @import("json_util.zig");
 pub const providers = struct {
     pub const anthropic = @import("providers/anthropic.zig");
     pub const openai = @import("providers/openai.zig");
+    pub const zhipu = @import("providers/zhipu.zig");
 };
 
 pub const Role = types.Role;

@@ -1,12 +1,27 @@
 const std = @import("std");
+const terminal = @import("terminal.zig");
 
 const Allocator = std.mem.Allocator;
+const LINE_RESET = "\x1b[0m";
+
+const ChangedRange = struct {
+    first: usize,
+    last: usize,
+};
+
+const RenderMode = enum {
+    no_change,
+    diff,
+    append_only,
+};
 
 pub const InlineRenderer = struct {
     allocator: Allocator,
     writer: std.fs.File,
     backbuffer: std.ArrayList([]u8),
     last_cursor_row: u16 = 0,
+    last_width: u16 = 0,
+    max_lines_rendered: u32 = 0,
 
     pub fn init(allocator: Allocator, writer: std.fs.File) InlineRenderer {
         return .{
@@ -29,63 +44,47 @@ pub const InlineRenderer = struct {
         cursor_row: u16,
         cursor_col: u16,
     ) !void {
+        assertCursorInBounds(lines.len, cursor_row);
+        self.refreshWidth();
+
+        const old_len = self.backbuffer.items.len;
+        const new_len = lines.len;
+        const max_len = @max(old_len, new_len);
+        const changed = findChangedRange(self.backbuffer.items, lines);
+
+        var mode: RenderMode = .no_change;
+        var range: ChangedRange = .{ .first = 0, .last = 0 };
+        if (changed) |base_range| {
+            range = base_range;
+            if (self.changeIsAboveViewport(range.first)) {
+                range.first = 0;
+                range.last = max_len - 1;
+            }
+
+            mode = .diff;
+            if (isAppendOnly(self, old_len, new_len, range, cursor_row)) {
+                mode = .append_only;
+            }
+        }
+
         var out: std.ArrayList(u8) = .{};
         defer out.deinit(self.allocator);
 
         // Begin synchronized output.
         try out.appendSlice(self.allocator, "\x1b[?2026h");
 
-        // Move cursor to top of our region.
-        if (self.last_cursor_row > 0) {
-            try out.writer(self.allocator).print("\x1b[{d}A", .{self.last_cursor_row});
-        }
-        try out.appendSlice(self.allocator, "\r");
-
-        const old_len = self.backbuffer.items.len;
-        const new_len = lines.len;
-        const max_len = @max(old_len, new_len);
-
-        if (old_len == 0) {
-            // First render: output all lines.
-            for (lines, 0..) |line, i| {
-                if (i > 0) try out.appendSlice(self.allocator, "\r\n");
-                try out.appendSlice(self.allocator, line);
-                try out.appendSlice(self.allocator, "\x1b[K");
-            }
-        } else {
-            // Diff render.
-            var row: usize = 0;
-            while (row < max_len) : (row += 1) {
-                if (row > 0) try out.appendSlice(self.allocator, "\r\n");
-
-                const old_line: []const u8 = if (row < old_len)
-                    self.backbuffer.items[row]
-                else
-                    "";
-                const new_line: []const u8 = if (row < new_len)
-                    lines[row]
-                else
-                    "";
-
-                if (std.mem.eql(u8, old_line, new_line) and row < new_len) {
-                    // Line unchanged, skip content but still need to move down.
-                    continue;
-                }
-
-                // Rewrite this line.
-                try out.appendSlice(self.allocator, "\r");
-                if (row < new_len) {
-                    try out.appendSlice(self.allocator, new_line);
-                }
-                try out.appendSlice(self.allocator, "\x1b[K");
-            }
+        var current_row: i32 = @intCast(self.last_cursor_row);
+        switch (mode) {
+            .no_change => {},
+            .diff => {
+                current_row = try self.renderDiffRange(&out, lines, range);
+            },
+            .append_only => {
+                current_row = try self.renderAppendOnly(&out, lines, old_len);
+            },
         }
 
-        // Position cursor.
-        const bottom: u16 = if (new_len == 0) 0 else @intCast(new_len - 1);
-        if (bottom > cursor_row) {
-            try out.writer(self.allocator).print("\x1b[{d}A", .{bottom - cursor_row});
-        }
+        try positionCursor(&out, self.allocator, current_row, cursor_row);
         try out.writer(self.allocator).print("\x1b[{d}G", .{cursor_col + 1});
         try out.appendSlice(self.allocator, "\x1b[?25h");
 
@@ -95,10 +94,13 @@ pub const InlineRenderer = struct {
         try self.writer.writeAll(out.items);
         try self.updateBackbuffer(lines);
         self.last_cursor_row = cursor_row;
+        self.updateMaxLinesRendered(new_len);
     }
 
     pub fn invalidate(self: *InlineRenderer) void {
         self.clearBackbuffer();
+        self.last_cursor_row = 0;
+        self.max_lines_rendered = 0;
     }
 
     fn updateBackbuffer(self: *InlineRenderer, lines: []const []const u8) !void {
@@ -116,7 +118,184 @@ pub const InlineRenderer = struct {
         }
         self.backbuffer.clearRetainingCapacity();
     }
+
+    fn refreshWidth(self: *InlineRenderer) void {
+        const size = terminal.getTerminalSize();
+        const width = if (size.width > 0) size.width else 80;
+        if (self.last_width != 0 and self.last_width != width) {
+            self.invalidate();
+        }
+        self.last_width = width;
+    }
+
+    fn changeIsAboveViewport(self: *const InlineRenderer, first_changed: usize) bool {
+        const term_size = terminal.getTerminalSize();
+        const term_height_u32: u32 = term_size.height;
+        if (self.max_lines_rendered <= term_height_u32) return false;
+        const viewport_top_u32 = self.max_lines_rendered - term_height_u32;
+        const viewport_top: usize = @intCast(viewport_top_u32);
+        return first_changed < viewport_top;
+    }
+
+    fn renderDiffRange(
+        self: *InlineRenderer,
+        out: *std.ArrayList(u8),
+        lines: []const []const u8,
+        range: ChangedRange,
+    ) !i32 {
+        try self.moveCursorToTop(out);
+        if (range.first > 0) {
+            try out.writer(self.allocator).print("\x1b[{d}B", .{range.first});
+        }
+
+        var row: usize = range.first;
+        while (true) {
+            if (row > range.first) {
+                try out.appendSlice(self.allocator, "\r\n");
+            }
+
+            const line: ?[]const u8 = if (row < lines.len) lines[row] else null;
+            try writeLine(out, self.allocator, line);
+
+            if (row == range.last) break;
+            row += 1;
+        }
+
+        return @intCast(range.last);
+    }
+
+    fn renderAppendOnly(
+        self: *InlineRenderer,
+        out: *std.ArrayList(u8),
+        lines: []const []const u8,
+        append_start: usize,
+    ) !i32 {
+        var row: i32 = @intCast(self.last_cursor_row);
+        var i: usize = append_start;
+        while (i < lines.len) : (i += 1) {
+            try out.appendSlice(self.allocator, "\r\n");
+            row += 1;
+            try writeLine(out, self.allocator, lines[i]);
+        }
+        return row;
+    }
+
+    fn moveCursorToTop(self: *InlineRenderer, out: *std.ArrayList(u8)) !void {
+        if (self.last_cursor_row > 0) {
+            try out.writer(self.allocator).print("\x1b[{d}A", .{self.last_cursor_row});
+        }
+        try out.appendSlice(self.allocator, "\r");
+    }
+
+    fn updateMaxLinesRendered(self: *InlineRenderer, line_count: usize) void {
+        const count_u32 = std.math.cast(u32, line_count) orelse std.math.maxInt(u32);
+        if (count_u32 > self.max_lines_rendered) {
+            self.max_lines_rendered = count_u32;
+        }
+    }
 };
+
+fn findChangedRange(
+    old_lines: []const []const u8,
+    new_lines: []const []const u8,
+) ?ChangedRange {
+    const max_len = @max(old_lines.len, new_lines.len);
+    var first: ?usize = null;
+    var last: usize = 0;
+
+    for (0..max_len) |i| {
+        const old_line: []const u8 = if (i < old_lines.len) old_lines[i] else "";
+        const new_line: []const u8 = if (i < new_lines.len) new_lines[i] else "";
+        if (!std.mem.eql(u8, old_line, new_line)) {
+            if (first == null) first = i;
+            last = i;
+        }
+    }
+
+    if (first == null) return null;
+    return .{ .first = first.?, .last = last };
+}
+
+fn isAppendOnly(
+    renderer: *const InlineRenderer,
+    old_len: usize,
+    new_len: usize,
+    range: ChangedRange,
+    cursor_row: u16,
+) bool {
+    if (old_len == 0) return false;
+    if (new_len <= old_len) return false;
+    if (range.first != old_len) return false;
+
+    const old_bottom = std.math.cast(u16, old_len - 1) orelse return false;
+    const new_bottom = std.math.cast(u16, new_len - 1) orelse return false;
+    if (renderer.last_cursor_row != old_bottom) return false;
+    return cursor_row == new_bottom;
+}
+
+fn positionCursor(
+    out: *std.ArrayList(u8),
+    allocator: Allocator,
+    current_row: i32,
+    target_row: u16,
+) !void {
+    const target: i32 = @intCast(target_row);
+    if (current_row > target) {
+        try out.writer(allocator).print("\x1b[{d}A", .{current_row - target});
+    } else if (target > current_row) {
+        try out.writer(allocator).print("\x1b[{d}B", .{target - current_row});
+    }
+}
+
+fn assertCursorInBounds(line_count: usize, cursor_row: u16) void {
+    if (line_count == 0) {
+        std.debug.assert(cursor_row == 0);
+        return;
+    }
+
+    std.debug.assert(line_count - 1 <= std.math.maxInt(u16));
+    const max_row: u16 = @intCast(line_count - 1);
+    std.debug.assert(cursor_row <= max_row);
+}
+
+fn writeLine(
+    out: *std.ArrayList(u8),
+    allocator: Allocator,
+    line: ?[]const u8,
+) !void {
+    try out.appendSlice(allocator, "\r\x1b[2K");
+    if (line) |line_text| {
+        try out.appendSlice(allocator, line_text);
+    }
+    try out.appendSlice(allocator, LINE_RESET);
+}
+
+fn countSubstr(haystack: []const u8, needle: []const u8) usize {
+    if (needle.len == 0) return 0;
+    var count: usize = 0;
+    var pos: usize = 0;
+    while (std.mem.indexOfPos(u8, haystack, pos, needle)) |at| {
+        count += 1;
+        pos = at + needle.len;
+    }
+    return count;
+}
+
+fn fileSize(file: std.fs.File) !u64 {
+    const stat = try file.stat();
+    return stat.size;
+}
+
+fn readDelta(
+    allocator: Allocator,
+    file: std.fs.File,
+    start: u64,
+) ![]u8 {
+    const end = try fileSize(file);
+    std.debug.assert(end >= start);
+    try file.seekTo(start);
+    return try file.readToEndAlloc(allocator, @intCast(end - start));
+}
 
 test "inline renderer tracks backbuffer" {
     // We can't test actual terminal output, but we can test the backbuffer logic.
@@ -159,4 +338,173 @@ test "inline renderer invalidate clears backbuffer" {
 
     r.invalidate();
     try std.testing.expectEqual(@as(usize, 0), r.backbuffer.items.len);
+}
+
+test "inline renderer precise diff renders only changed band" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const file = try tmp.dir.createFile("out3", .{ .read = true });
+    defer file.close();
+
+    var r = InlineRenderer.init(allocator, file);
+    defer r.deinit();
+
+    const old_lines = [_][]const u8{ "line-a", "line-b", "line-c" };
+    try r.render(&old_lines, 2, 0);
+
+    const start = try fileSize(file);
+    const new_lines = [_][]const u8{ "line-a", "line-b-updated", "line-c" };
+    try r.render(&new_lines, 2, 0);
+
+    const delta = try readDelta(allocator, file, start);
+    defer allocator.free(delta);
+
+    try std.testing.expect(std.mem.indexOf(u8, delta, "line-b-updated") != null);
+    try std.testing.expect(std.mem.indexOf(u8, delta, "line-a") == null);
+    try std.testing.expect(std.mem.indexOf(u8, delta, "line-c") == null);
+    try std.testing.expectEqual(@as(usize, 0), countSubstr(delta, "\r\n"));
+}
+
+test "inline renderer append-only path skips upward cursor jumps" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const file = try tmp.dir.createFile("out4", .{ .read = true });
+    defer file.close();
+
+    var r = InlineRenderer.init(allocator, file);
+    defer r.deinit();
+
+    const old_lines = [_][]const u8{"alpha"};
+    try r.render(&old_lines, 0, 0);
+
+    const start = try fileSize(file);
+    const new_lines = [_][]const u8{ "alpha", "beta" };
+    try r.render(&new_lines, 1, 0);
+
+    const delta = try readDelta(allocator, file, start);
+    defer allocator.free(delta);
+
+    try std.testing.expect(std.mem.indexOf(u8, delta, "\r\n\r\x1b[2Kbeta") != null);
+    try std.testing.expect(std.mem.indexOf(u8, delta, "\x1b[1A") == null);
+}
+
+test "inline renderer clears trailing rows when content shrinks" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const file = try tmp.dir.createFile("out5", .{ .read = true });
+    defer file.close();
+
+    var r = InlineRenderer.init(allocator, file);
+    defer r.deinit();
+
+    const old_lines = [_][]const u8{ "one", "two", "three" };
+    try r.render(&old_lines, 2, 0);
+
+    const start = try fileSize(file);
+    const new_lines = [_][]const u8{"one"};
+    try r.render(&new_lines, 0, 0);
+
+    const delta = try readDelta(allocator, file, start);
+    defer allocator.free(delta);
+
+    try std.testing.expect(countSubstr(delta, "\x1b[2K") >= 2);
+}
+
+test "inline renderer appends line reset for every rendered line" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const file = try tmp.dir.createFile("out6", .{ .read = true });
+    defer file.close();
+
+    var r = InlineRenderer.init(allocator, file);
+    defer r.deinit();
+
+    const lines = [_][]const u8{ "hello", "world" };
+    try r.render(&lines, 1, 0);
+
+    const output = try readDelta(allocator, file, 0);
+    defer allocator.free(output);
+
+    try std.testing.expect(countSubstr(output, LINE_RESET) >= 2);
+}
+
+test "inline renderer width change invalidates and redraws full content" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const file = try tmp.dir.createFile("out7", .{ .read = true });
+    defer file.close();
+
+    var r = InlineRenderer.init(allocator, file);
+    defer r.deinit();
+
+    const lines = [_][]const u8{ "first", "second" };
+    try r.render(&lines, 1, 0);
+
+    const start = try fileSize(file);
+    r.last_width +|= 1;
+    try r.render(&lines, 1, 0);
+
+    const delta = try readDelta(allocator, file, start);
+    defer allocator.free(delta);
+
+    try std.testing.expect(std.mem.indexOf(u8, delta, "first") != null);
+    try std.testing.expect(std.mem.indexOf(u8, delta, "second") != null);
+}
+
+test "inline renderer forces full redraw when change is above viewport" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const file = try tmp.dir.createFile("out8", .{ .read = true });
+    defer file.close();
+
+    var r = InlineRenderer.init(allocator, file);
+    defer r.deinit();
+
+    const old_lines = [_][]const u8{
+        "line-0",
+        "line-1",
+        "line-2",
+        "line-3",
+        "line-4",
+        "line-5",
+    };
+    try r.render(&old_lines, 5, 0);
+
+    const term_height = terminal.getTerminalSize().height;
+    r.max_lines_rendered = @as(u32, term_height) + 4;
+
+    const start = try fileSize(file);
+    const new_lines = [_][]const u8{
+        "line-0-updated",
+        "line-1",
+        "line-2",
+        "line-3",
+        "line-4",
+        "line-5",
+    };
+    try r.render(&new_lines, 5, 0);
+
+    const delta = try readDelta(allocator, file, start);
+    defer allocator.free(delta);
+
+    try std.testing.expect(std.mem.indexOf(u8, delta, "line-0-updated") != null);
+    try std.testing.expect(std.mem.indexOf(u8, delta, "line-4") != null);
 }

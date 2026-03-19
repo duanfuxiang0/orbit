@@ -3,12 +3,17 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const xev_dep = b.dependency("libxev", .{
+        .target = target,
+        .optimize = optimize,
+    });
 
     const exe_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
     });
+    exe_mod.addImport("xev", xev_dep.module("xev"));
 
     const exe = b.addExecutable(.{
         .name = "orbit",
@@ -27,6 +32,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    tests_mod.addImport("xev", xev_dep.module("xev"));
     const tests = b.addTest(.{
         .root_module = tests_mod,
     });
