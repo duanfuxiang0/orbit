@@ -17,7 +17,7 @@ CLI 层组装这些组件来渲染 agent 输出和接收用户输入。
 
 核心能力：
 - 组件化渲染（Component 接口 + Container 垂直堆叠）
-- Editor 输入组件（光标移动、退格、历史记录、Emacs 快捷键）
+- Editor 输入组件（具体输入行为现以 `rfcs/0007-terminal-input-editor.md` 为准）
 - Markdown 渲染（标题、代码块、ANSI 样式）
 - 差分渲染（backbuffer 比较，只重绘变化行，synchronized output 防闪烁）
 

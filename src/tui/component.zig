@@ -1,7 +1,9 @@
 const std = @import("std");
 const lines_util = @import("lines_util.zig");
+const input_mod = @import("input.zig");
 
 const Allocator = std.mem.Allocator;
+const InputEvent = input_mod.InputEvent;
 
 pub const Component = struct {
     ptr: *anyopaque,
@@ -9,7 +11,7 @@ pub const Component = struct {
 
     pub const VTable = struct {
         render: *const fn (ptr: *anyopaque, width: u16, allocator: Allocator) anyerror![][]const u8,
-        handle_input: ?*const fn (ptr: *anyopaque, data: []const u8) anyerror!bool,
+        handle_input: ?*const fn (ptr: *anyopaque, event: InputEvent) anyerror!bool,
         invalidate: *const fn (ptr: *anyopaque) void,
         deinit: *const fn (ptr: *anyopaque) void,
     };
@@ -18,9 +20,9 @@ pub const Component = struct {
         return self.vtable.render(self.ptr, width, allocator);
     }
 
-    pub fn handleInput(self: Component, data: []const u8) !bool {
+    pub fn handleInput(self: Component, event: InputEvent) !bool {
         if (self.vtable.handle_input) |handler| {
-            return try handler(self.ptr, data);
+            return try handler(self.ptr, event);
         }
         return false;
     }

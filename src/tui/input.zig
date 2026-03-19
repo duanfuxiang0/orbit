@@ -5,12 +5,14 @@ pub const Action = enum {
     newline,
     backspace,
     delete,
+    delete_to_end,
     cursor_left,
     cursor_right,
     cursor_up,
     cursor_down,
     line_start,
     line_end,
+    clear_input,
     end_of_transmission,
 };
 
@@ -230,9 +232,11 @@ fn controlAction(byte: u8) ?Action {
         '\r' => .submit,
         '\n' => .newline,
         0x7f, 0x08 => .backspace,
+        0x0b => .delete_to_end,
         0x01 => .line_start,
         0x05 => .line_end,
         0x02 => .cursor_left,
+        0x03 => .clear_input,
         0x06 => .cursor_right,
         0x10 => .cursor_up,
         0x0e => .cursor_down,
@@ -358,11 +362,13 @@ fn mapCsiUAction(parsed: CsiUSequence) ?Action {
     return switch (codepoint) {
         'a' => .line_start,
         'b' => .cursor_left,
+        'c' => .clear_input,
         'd' => .end_of_transmission,
         'e' => .line_end,
         'f' => .cursor_right,
         'h' => .backspace,
         'j' => .newline,
+        'k' => .delete_to_end,
         'n' => .cursor_down,
         'p' => .cursor_up,
         else => null,
@@ -429,11 +435,13 @@ fn parseModifyOtherKeys(seq: []const u8) ?Action {
     return switch (code_value) {
         'a' => .line_start,
         'b' => .cursor_left,
+        'c' => .clear_input,
         'd' => .end_of_transmission,
         'e' => .line_end,
         'f' => .cursor_right,
         'h' => .backspace,
         'j' => .newline,
+        'k' => .delete_to_end,
         'n' => .cursor_down,
         'p' => .cursor_up,
         else => null,
@@ -523,6 +531,23 @@ test "decoder maps ctrl+b and ctrl+f navigation" {
     try std.testing.expectEqual(@as(usize, 2), collector.events.items.len);
     try std.testing.expectEqual(Action.cursor_left, collector.events.items[0].action);
     try std.testing.expectEqual(Action.cursor_right, collector.events.items[1].action);
+}
+
+test "decoder maps ctrl+k and ctrl+c editing actions" {
+    var decoder = InputDecoder{};
+    var collector = Collector.init(std.testing.allocator);
+    defer collector.deinit();
+
+    try decoder.pushBytes("\x0b", &collector, Collector.onEvent);
+    try decoder.pushBytes("\x03", &collector, Collector.onEvent);
+    try decoder.pushBytes("\x1b[107;5u", &collector, Collector.onEvent);
+    try decoder.pushBytes("\x1b[27;5;99~", &collector, Collector.onEvent);
+
+    try std.testing.expectEqual(@as(usize, 4), collector.events.items.len);
+    try std.testing.expectEqual(Action.delete_to_end, collector.events.items[0].action);
+    try std.testing.expectEqual(Action.clear_input, collector.events.items[1].action);
+    try std.testing.expectEqual(Action.delete_to_end, collector.events.items[2].action);
+    try std.testing.expectEqual(Action.clear_input, collector.events.items[3].action);
 }
 
 test "decoder emits bracketed paste without submit actions" {
