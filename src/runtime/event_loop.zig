@@ -113,6 +113,28 @@ pub const EventLoop = struct {
         defer self.mutex.unlock();
 
         for (self.timers.items) |timer| {
+            if (timer.pending_disarm) {
+                timer.pending_disarm = false;
+                timer.needs_arm = false;
+                timer.callback = null;
+                timer.callback_ctx = null;
+                timer.pending_ms = 1;
+
+                // Force a short disarm cycle so any active xev completion reaches
+                // .dead before timer memory can be reclaimed by deinit().
+                timer.xev_timer.reset(
+                    &self.loop,
+                    &timer.run_c,
+                    &timer.reset_c,
+                    timer.pending_ms,
+                    Timer,
+                    timer,
+                    Timer.onXevFire,
+                );
+                timer.armed = true;
+                continue;
+            }
+
             if (!timer.needs_arm) continue;
             timer.needs_arm = false;
 
@@ -126,6 +148,7 @@ pub const EventLoop = struct {
                 timer,
                 Timer.onXevFire,
             );
+            timer.armed = true;
         }
     }
 
@@ -159,7 +182,9 @@ pub const Timer = struct {
     callback_ctx: ?*anyopaque = null,
     pending_ms: u64 = 0,
     needs_arm: bool = false,
+    pending_disarm: bool = false,
     registered: bool = false,
+    armed: bool = false,
     firing: bool = false,
     firing_cond: std.Thread.Condition = .{},
 
@@ -186,12 +211,11 @@ pub const Timer = struct {
             return;
         }
 
+        std.debug.assert(!self.firing);
+        std.debug.assert(!self.armed);
+        std.debug.assert(!self.pending_disarm);
+        std.debug.assert(!self.needs_arm);
         el.removeTimerLocked(self);
-
-        // Wait for any in-flight callback to complete.
-        while (self.firing) {
-            self.firing_cond.wait(&el.mutex);
-        }
         el.mutex.unlock();
 
         self.xev_timer.deinit();
@@ -215,6 +239,7 @@ pub const Timer = struct {
 
         try self.ensureRegisteredLocked();
 
+        self.pending_disarm = false;
         self.callback = cb;
         self.callback_ctx = ctx;
         self.pending_ms = ms;
@@ -234,11 +259,15 @@ pub const Timer = struct {
         self.needs_arm = false;
         self.callback = null;
         self.callback_ctx = null;
+        if (self.armed) {
+            self.pending_disarm = true;
+            el.wakeup.notify() catch {};
+        }
 
         // If cancellation races with an in-flight callback on another thread,
         // wait until it finishes to guarantee postcondition on return.
         if (el.isOnWorkerThread()) return;
-        while (self.firing) {
+        while (self.firing or self.armed or self.pending_disarm or self.needs_arm) {
             self.firing_cond.wait(&el.mutex);
         }
     }
@@ -269,8 +298,11 @@ pub const Timer = struct {
         self.callback = null;
         self.callback_ctx = null;
         self.needs_arm = false;
+        self.pending_disarm = false;
+        self.armed = false;
 
         if (cb == null or cb_ctx == null) {
+            self.firing_cond.broadcast();
             el.mutex.unlock();
             return .disarm;
         }
@@ -402,4 +434,31 @@ test "timer cancel waits for in-flight callback" {
     timer.cancel();
     try std.testing.expect(ctx.finished.load(.acquire));
     try std.testing.expectEqual(@as(u32, 1), ctx.counter.load(.acquire));
+}
+
+test "timer deinit drains pending xev completion" {
+    const Ctx = struct {
+        fired: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+
+        fn onFire(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            _ = self.fired.fetchAdd(1, .acq_rel);
+        }
+    };
+
+    var event_loop: EventLoop = undefined;
+    try event_loop.init(std.testing.allocator);
+    defer event_loop.deinit();
+
+    var ctx = Ctx{};
+    var i: u32 = 0;
+    while (i < 64) : (i += 1) {
+        var timer = Timer.init(&event_loop);
+        try timer.armAfter(50 * std.time.ns_per_ms, Ctx.onFire, &ctx);
+        timer.deinit();
+    }
+
+    std.Thread.sleep(100 * std.time.ns_per_ms);
+    try std.testing.expectEqual(@as(u32, 0), ctx.fired.load(.acquire));
+    try std.testing.expect(!event_loop.hasError());
 }
