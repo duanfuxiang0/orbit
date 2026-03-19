@@ -429,7 +429,10 @@ fn tokenizeBash(allocator: Allocator, source: []const u8) ![]TokenSpan {
         if (isIdentifierStart(ch)) {
             const end = scanIdentifier(source, i);
             const ident = source[i..end];
-            const kind = classifyBashIdentifier(ident, source, end);
+            var kind = classifyBashIdentifier(ident, source, end);
+            if (kind == .plain and isBashCommandIdentifier(source, i, end)) {
+                kind = .function;
+            }
             if (kind != .plain) {
                 try spans.append(allocator, .{ .kind = kind, .start = i, .end = end });
             }
@@ -691,6 +694,28 @@ fn classifyBashIdentifier(ident: []const u8, source: []const u8, end_idx: usize)
     return .plain;
 }
 
+fn isBashCommandIdentifier(source: []const u8, start_idx: usize, end_idx: usize) bool {
+    if (isBashAssignmentAt(source, end_idx)) return false;
+
+    var i = start_idx;
+    while (i > 0) {
+        i -= 1;
+        const byte = source[i];
+        if (std.ascii.isWhitespace(byte)) continue;
+        return switch (byte) {
+            ';', '|', '&', '(', ')', '{', '}' => true,
+            else => false,
+        };
+    }
+    return true;
+}
+
+fn isBashAssignmentAt(source: []const u8, end_idx: usize) bool {
+    if (end_idx >= source.len) return false;
+    if (source[end_idx] == '=') return true;
+    return end_idx + 1 < source.len and source[end_idx] == '+' and source[end_idx + 1] == '=';
+}
+
 fn classifyByTables(
     ident: []const u8,
     source: []const u8,
@@ -786,6 +811,15 @@ test "tokenize bash line highlights keyword and string" {
         }
     }
     try std.testing.expect(found_string);
+}
+
+test "tokenize bash line highlights command identifier" {
+    const spans = try tokenizeLine(std.testing.allocator, "git status", .bash);
+    defer std.testing.allocator.free(spans);
+
+    try std.testing.expect(spans.len >= 1);
+    try std.testing.expectEqual(TokenKind.function, spans[0].kind);
+    try std.testing.expectEqualStrings("git", "git status"[spans[0].start..spans[0].end]);
 }
 
 test "tokenize cpp line highlights keyword and type" {

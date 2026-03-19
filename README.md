@@ -26,6 +26,12 @@ Run tests:
 zig build test
 ```
 
+Interactive slash commands (TTY mode):
+- `/new` create a new session
+- `/resume [session-id]` list or switch sessions
+- `/model [provider/id]` show or switch model
+- `/quit` exit (`/exit` alias kept)
+
 Format code:
 ```bash
 zig fmt src/ai/*.zig src/agent/*.zig src/cli/*.zig src/main.zig src/tests.zig build.zig

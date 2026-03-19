@@ -123,7 +123,7 @@ pub fn loadLatest(
     sessions_dir: []const u8,
 ) !?Session {
     const summaries = try list(allocator, sessions_dir);
-    defer freeSummaries(allocator, summaries);
+    defer freeSummaryList(allocator, summaries);
     if (summaries.len == 0) return null;
     return try load(allocator, sessions_dir, summaries[0].id.slice());
 }
@@ -196,7 +196,7 @@ fn compareSummaryDesc(_: void, lhs: SessionSummary, rhs: SessionSummary) bool {
     return lhs.updated_at > rhs.updated_at;
 }
 
-fn freeSummaries(allocator: std.mem.Allocator, summaries: []SessionSummary) void {
+pub fn freeSummaryList(allocator: std.mem.Allocator, summaries: []SessionSummary) void {
     for (summaries) |*summary| summary.deinit(allocator);
     allocator.free(summaries);
 }

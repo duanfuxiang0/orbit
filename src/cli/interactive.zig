@@ -2,11 +2,14 @@ const std = @import("std");
 const ai = @import("../ai/root.zig");
 const agent_mod = @import("../agent/root.zig");
 const agent_types = @import("../agent/types.zig");
+const config_mod = @import("config.zig");
+const model_runtime = @import("model_runtime.zig");
 const session_mod = @import("session.zig");
 const runtime = @import("../runtime/root.zig");
 const stdin_lines = @import("stdin_lines.zig");
 const tui = @import("../tui/root.zig");
 const ansi = @import("../tui/ansi.zig");
+const highlight = @import("../tui/highlight.zig");
 const theme = @import("../tui/theme.zig");
 const terminal = @import("../tui/terminal.zig");
 const lines_util = @import("../tui/lines_util.zig");
@@ -32,13 +35,34 @@ const ActiveToolLine = struct {
     label: []u8,
 };
 
+const SlashUsageKind = enum {
+    generic,
+    new_session,
+    resume_cmd,
+    model_cmd,
+    quit,
+};
+
+const SlashCommand = union(enum) {
+    not_command,
+    quit,
+    new_session,
+    resume_list,
+    resume_id: []const u8,
+    show_model,
+    set_model: []const u8,
+    usage_error: SlashUsageKind,
+    unknown: []const u8,
+};
+
 pub fn run(
     allocator: std.mem.Allocator,
     agent: *agent_mod.Agent,
     session: *session_mod.Session,
+    config: *const config_mod.Config,
+    provider_binding: *model_runtime.ProviderBinding,
+    verbose: bool,
 ) !void {
-    _ = session;
-
     const stdout_file = std.fs.File.stdout();
     const stdin_file = std.fs.File.stdin();
 
@@ -74,6 +98,10 @@ pub fn run(
     var input_ctx = InputCtx{
         .allocator = allocator,
         .agent = agent,
+        .session = session,
+        .config = config,
+        .provider_binding = provider_binding,
+        .verbose = verbose,
         .editor = &ed,
         .renderer = &renderer,
         .writer = stdout_file,
@@ -97,6 +125,10 @@ pub fn run(
 fn handleSubmit(
     allocator: std.mem.Allocator,
     agent: *agent_mod.Agent,
+    session: *session_mod.Session,
+    config: *const config_mod.Config,
+    provider_binding: *model_runtime.ProviderBinding,
+    verbose: bool,
     ed: *tui.Editor,
     renderer: *tui.InlineRenderer,
     writer: std.fs.File,
@@ -110,10 +142,29 @@ fn handleSubmit(
     try writer.writeAll("\r\n\r\n");
     renderer.invalidate();
 
-    if (std.mem.eql(u8, trimmed, "/exit")) return true;
-
     try ed.pushHistory();
     ed.clear();
+
+    const slash = parseSlashCommand(trimmed);
+    if (slash != .not_command) {
+        const should_exit = executeSlashCommand(
+            allocator,
+            agent,
+            session,
+            config,
+            provider_binding,
+            verbose,
+            writer,
+            current_theme,
+            slash,
+        ) catch |err| blk: {
+            try renderSlashError(writer, current_theme, @errorName(err));
+            break :blk false;
+        };
+        renderer.invalidate();
+        try renderEditor(renderer, ed, allocator);
+        return should_exit;
+    }
 
     var sink_ctx = StreamSinkCtx.init(allocator, writer, event_loop, current_theme);
     defer sink_ctx.deinit();
@@ -128,10 +179,382 @@ fn handleSubmit(
     // After agent turn, flush any remaining markdown content.
     sink_ctx.flushMarkdown();
     try writer.writeAll("\n");
+    try saveSessionSnapshot(allocator, config.sessions_dir, session, agent);
 
     renderer.invalidate();
     try renderEditor(renderer, ed, allocator);
     return false;
+}
+
+fn parseSlashCommand(trimmed: []const u8) SlashCommand {
+    if (trimmed.len == 0 or trimmed[0] != '/') return .not_command;
+
+    const body = std.mem.trimLeft(u8, trimmed[1..], " \t");
+    if (body.len == 0) return .{ .usage_error = .generic };
+
+    var parts = std.mem.tokenizeAny(u8, body, " \t");
+    const command = parts.next() orelse return .{ .usage_error = .generic };
+    const arg = parts.next();
+    const extra = parts.next();
+
+    if (std.mem.eql(u8, command, "exit") or std.mem.eql(u8, command, "quit")) {
+        if (arg != null) return .{ .usage_error = .quit };
+        return .quit;
+    }
+    if (std.mem.eql(u8, command, "new")) {
+        if (arg != null) return .{ .usage_error = .new_session };
+        return .new_session;
+    }
+    if (std.mem.eql(u8, command, "resume")) {
+        if (arg == null) return .resume_list;
+        if (extra != null) return .{ .usage_error = .resume_cmd };
+        return .{ .resume_id = arg.? };
+    }
+    if (std.mem.eql(u8, command, "model")) {
+        if (arg == null) return .show_model;
+        if (extra != null) return .{ .usage_error = .model_cmd };
+        return .{ .set_model = arg.? };
+    }
+    return .{ .unknown = command };
+}
+
+fn executeSlashCommand(
+    allocator: std.mem.Allocator,
+    agent: *agent_mod.Agent,
+    session: *session_mod.Session,
+    config: *const config_mod.Config,
+    provider_binding: *model_runtime.ProviderBinding,
+    verbose: bool,
+    writer: std.fs.File,
+    current_theme: theme.Theme,
+    command: SlashCommand,
+) !bool {
+    switch (command) {
+        .not_command => return false,
+        .quit => return true,
+        .new_session => {
+            try commandNewSession(allocator, agent, session, config.sessions_dir, provider_binding);
+            const msg = try std.fmt.allocPrint(allocator, "new session: {s}", .{session.id.slice()});
+            defer allocator.free(msg);
+            try renderSlashInfo(writer, current_theme, msg);
+            return false;
+        },
+        .resume_list => {
+            try commandResumeList(allocator, writer, current_theme, config.sessions_dir, session);
+            return false;
+        },
+        .resume_id => |id| {
+            try commandResumeId(
+                allocator,
+                agent,
+                session,
+                config,
+                provider_binding,
+                verbose,
+                id,
+            );
+            const current_model = provider_binding.currentModel();
+            const msg = try std.fmt.allocPrint(
+                allocator,
+                "resumed {s} ({s}/{s})",
+                .{ session.id.slice(), current_model.provider, current_model.id },
+            );
+            defer allocator.free(msg);
+            try renderSlashInfo(writer, current_theme, msg);
+            return false;
+        },
+        .show_model => {
+            try commandShowModel(writer, current_theme, provider_binding);
+            return false;
+        },
+        .set_model => |model_spec| {
+            try commandSetModel(
+                allocator,
+                agent,
+                session,
+                config,
+                provider_binding,
+                verbose,
+                model_spec,
+            );
+            const current_model = provider_binding.currentModel();
+            const msg = try std.fmt.allocPrint(
+                allocator,
+                "model set: {s}/{s}",
+                .{ current_model.provider, current_model.id },
+            );
+            defer allocator.free(msg);
+            try renderSlashInfo(writer, current_theme, msg);
+            return false;
+        },
+        .usage_error => |kind| {
+            try renderSlashError(writer, current_theme, usageText(kind));
+            return false;
+        },
+        .unknown => |name| {
+            const msg = try std.fmt.allocPrint(allocator, "unknown command: /{s}", .{name});
+            defer allocator.free(msg);
+            try renderSlashError(writer, current_theme, msg);
+            try renderSlashInfo(writer, current_theme, usageText(.generic));
+            return false;
+        },
+    }
+}
+
+fn usageText(kind: SlashUsageKind) []const u8 {
+    return switch (kind) {
+        .generic => "commands: /new, /resume [id], /model [provider/id], /quit",
+        .new_session => "usage: /new",
+        .resume_cmd => "usage: /resume [session-id]",
+        .model_cmd => "usage: /model [provider/id|builtin-id]",
+        .quit => "usage: /quit",
+    };
+}
+
+fn commandNewSession(
+    allocator: std.mem.Allocator,
+    agent: *agent_mod.Agent,
+    session: *session_mod.Session,
+    sessions_dir: []const u8,
+    provider_binding: *model_runtime.ProviderBinding,
+) !void {
+    try saveSessionSnapshot(allocator, sessions_dir, session, agent);
+
+    var new_session = try session_mod.Session.init(
+        allocator,
+        provider_binding.currentModel(),
+        session.cwd,
+    );
+    var new_session_owned = true;
+    errdefer if (new_session_owned) new_session.deinit();
+
+    clearAgentMessages(allocator, agent);
+    agent.total_usage = .{};
+
+    session.deinit();
+    session.* = new_session;
+    new_session_owned = false;
+
+    try saveSessionSnapshot(allocator, sessions_dir, session, agent);
+}
+
+fn commandResumeList(
+    allocator: std.mem.Allocator,
+    writer: std.fs.File,
+    current_theme: theme.Theme,
+    sessions_dir: []const u8,
+    session: *const session_mod.Session,
+) !void {
+    const summaries = try session_mod.list(allocator, sessions_dir);
+    defer session_mod.freeSummaryList(allocator, summaries);
+
+    if (summaries.len == 0) {
+        try renderSlashInfo(writer, current_theme, "no saved sessions");
+        return;
+    }
+
+    try renderSlashInfo(writer, current_theme, "recent sessions:");
+    for (summaries) |summary| {
+        const marker = if (std.mem.eql(u8, summary.id.slice(), session.id.slice())) "*" else " ";
+        const line = try std.fmt.allocPrint(
+            allocator,
+            "{s} {s}  model={s}  messages={d}",
+            .{ marker, summary.id.slice(), summary.model_id, summary.message_count },
+        );
+        try writer.writeAll(line);
+        try writer.writeAll("\n");
+        allocator.free(line);
+    }
+}
+
+fn commandResumeId(
+    allocator: std.mem.Allocator,
+    agent: *agent_mod.Agent,
+    session: *session_mod.Session,
+    config: *const config_mod.Config,
+    provider_binding: *model_runtime.ProviderBinding,
+    verbose: bool,
+    id: []const u8,
+) !void {
+    if (std.mem.eql(u8, id, session.id.slice())) return;
+
+    try saveSessionSnapshot(allocator, config.sessions_dir, session, agent);
+
+    var loaded = try session_mod.load(allocator, config.sessions_dir, id);
+    var loaded_owned = true;
+    errdefer if (loaded_owned) loaded.deinit();
+
+    const qualified_model = try std.fmt.allocPrint(
+        allocator,
+        "{s}/{s}",
+        .{ loaded.provider, loaded.model_id },
+    );
+    defer allocator.free(qualified_model);
+
+    var resolved = try model_runtime.resolveModel(
+        allocator,
+        config.default_model,
+        qualified_model,
+    );
+    defer resolved.deinit(allocator);
+
+    const new_binding = try model_runtime.ProviderBinding.init(
+        allocator,
+        config,
+        resolved.model,
+        verbose,
+    );
+
+    var old_binding = provider_binding.*;
+    provider_binding.* = new_binding;
+    agent.setModel(provider_binding.provider(), provider_binding.currentModel());
+    old_binding.deinit();
+
+    clearAgentMessages(allocator, agent);
+    agent.messages = loaded.messages;
+    loaded.messages = .empty;
+    agent.total_usage = loaded.total_usage;
+
+    session.deinit();
+    session.* = loaded;
+    loaded_owned = false;
+
+    try saveSessionSnapshot(allocator, config.sessions_dir, session, agent);
+}
+
+fn commandShowModel(
+    writer: std.fs.File,
+    current_theme: theme.Theme,
+    provider_binding: *model_runtime.ProviderBinding,
+) !void {
+    const current = provider_binding.currentModel();
+    var line_buf: [256]u8 = undefined;
+    const current_line = try std.fmt.bufPrint(
+        &line_buf,
+        "current model: {s}/{s}",
+        .{ current.provider, current.id },
+    );
+    try renderSlashInfo(writer, current_theme, current_line);
+    try renderSlashInfo(writer, current_theme, "available models:");
+
+    for (ai.models.builtin_models) |entry| {
+        var model_buf: [256]u8 = undefined;
+        const line = try std.fmt.bufPrint(
+            &model_buf,
+            "  - {s}/{s}",
+            .{ entry.provider, entry.id },
+        );
+        try writer.writeAll(line);
+        try writer.writeAll("\n");
+    }
+}
+
+fn commandSetModel(
+    allocator: std.mem.Allocator,
+    agent: *agent_mod.Agent,
+    session: *session_mod.Session,
+    config: *const config_mod.Config,
+    provider_binding: *model_runtime.ProviderBinding,
+    verbose: bool,
+    model_spec: []const u8,
+) !void {
+    var resolved = try model_runtime.resolveModel(allocator, config.default_model, model_spec);
+    defer resolved.deinit(allocator);
+
+    const next_model_id = try allocator.dupe(u8, resolved.model.id);
+    var model_owned = true;
+    errdefer if (model_owned) allocator.free(next_model_id);
+
+    const next_provider = try allocator.dupe(u8, resolved.model.provider);
+    errdefer if (model_owned) allocator.free(next_provider);
+
+    var new_binding = try model_runtime.ProviderBinding.init(
+        allocator,
+        config,
+        resolved.model,
+        verbose,
+    );
+    var binding_owned = true;
+    errdefer if (binding_owned) new_binding.deinit();
+
+    try saveSessionSnapshot(allocator, config.sessions_dir, session, agent);
+
+    allocator.free(session.model_id);
+    allocator.free(session.provider);
+    session.model_id = next_model_id;
+    session.provider = next_provider;
+    model_owned = false;
+
+    var old_binding = provider_binding.*;
+    provider_binding.* = new_binding;
+    binding_owned = false;
+    agent.setModel(provider_binding.provider(), provider_binding.currentModel());
+    old_binding.deinit();
+
+    try saveSessionSnapshot(allocator, config.sessions_dir, session, agent);
+}
+
+fn saveSessionSnapshot(
+    allocator: std.mem.Allocator,
+    sessions_dir: []const u8,
+    session: *session_mod.Session,
+    agent: *agent_mod.Agent,
+) !void {
+    std.debug.assert(session.messages.items.len == 0);
+    session.updated_at = std.time.timestamp();
+    session.total_usage = agent.total_usage;
+    session.messages = agent.messages;
+    agent.messages = .empty;
+    errdefer {
+        agent.messages = session.messages;
+        session.messages = .empty;
+    }
+    try session_mod.save(allocator, sessions_dir, session);
+    agent.messages = session.messages;
+    session.messages = .empty;
+}
+
+fn clearAgentMessages(allocator: std.mem.Allocator, agent: *agent_mod.Agent) void {
+    for (agent.messages.items) |message| {
+        ai.context.freeMessage(allocator, message);
+    }
+    agent.messages.deinit(allocator);
+    agent.messages = .empty;
+}
+
+fn renderSlashInfo(
+    writer: std.fs.File,
+    current_theme: theme.Theme,
+    message: []const u8,
+) !void {
+    if (ansi.isEnabled(current_theme)) {
+        var fg_buf: [24]u8 = undefined;
+        try writer.writeAll(ansi.fgPrefix(&fg_buf, current_theme, current_theme.palette.dim));
+    }
+    try writer.writeAll(message);
+    if (ansi.isEnabled(current_theme)) {
+        try writer.writeAll(ansi.resetCode(current_theme));
+    }
+    try writer.writeAll("\n");
+}
+
+fn renderSlashError(
+    writer: std.fs.File,
+    current_theme: theme.Theme,
+    message: []const u8,
+) !void {
+    if (ansi.isEnabled(current_theme)) {
+        var fg_buf: [24]u8 = undefined;
+        try writer.writeAll(
+            ansi.fgPrefix(&fg_buf, current_theme, current_theme.palette.tool_error),
+        );
+    }
+    try writer.writeAll("error: ");
+    try writer.writeAll(message);
+    if (ansi.isEnabled(current_theme)) {
+        try writer.writeAll(ansi.resetCode(current_theme));
+    }
+    try writer.writeAll("\n");
 }
 
 fn renderEditor(
@@ -153,6 +576,10 @@ fn renderEditor(
 const InputCtx = struct {
     allocator: std.mem.Allocator,
     agent: *agent_mod.Agent,
+    session: *session_mod.Session,
+    config: *const config_mod.Config,
+    provider_binding: *model_runtime.ProviderBinding,
+    verbose: bool,
     editor: *tui.Editor,
     renderer: *tui.InlineRenderer,
     writer: std.fs.File,
@@ -168,6 +595,10 @@ const InputCtx = struct {
                     self.should_exit = try handleSubmit(
                         self.allocator,
                         self.agent,
+                        self.session,
+                        self.config,
+                        self.provider_binding,
+                        self.verbose,
                         self.editor,
                         self.renderer,
                         self.writer,
@@ -518,11 +949,22 @@ fn formatToolLabel(
 ) ![]u8 {
     const args = try summarizeToolArguments(allocator, tool_name, arguments, max_args_len);
     defer allocator.free(args);
+
+    var styled_bash_args: ?[]u8 = null;
+    defer if (styled_bash_args) |buf| allocator.free(buf);
+
+    const rendered_args = blk: {
+        if (!std.mem.eql(u8, tool_name, "bash")) break :blk args;
+        if (std.mem.eql(u8, args, "{}")) break :blk args;
+        styled_bash_args = highlight.renderLine(allocator, args, .bash, current_theme) catch null;
+        break :blk styled_bash_args orelse args;
+    };
+
     const display_name = toolDisplayName(tool_name);
     var fg_buf: [24]u8 = undefined;
     const label_color = ansi.fgPrefix(&fg_buf, current_theme, current_theme.palette.link);
     const reset_code = ansi.resetCode(current_theme);
-    if (std.mem.eql(u8, args, "{}")) {
+    if (std.mem.eql(u8, rendered_args, "{}")) {
         return std.fmt.allocPrint(
             allocator,
             "• {s}{s}{s}",
@@ -532,7 +974,7 @@ fn formatToolLabel(
     return std.fmt.allocPrint(
         allocator,
         "• {s}{s}{s} {s}",
-        .{ label_color, display_name, reset_code, args },
+        .{ label_color, display_name, reset_code, rendered_args },
     );
 }
 
@@ -976,6 +1418,38 @@ fn waitForMarkdownRender(sink: *StreamSinkCtx, timeout_ms: u32) bool {
     }
 }
 
+test "parse slash command handles quit and new" {
+    try std.testing.expect(parseSlashCommand("/quit") == .quit);
+    try std.testing.expect(parseSlashCommand("/exit") == .quit);
+    try std.testing.expect(parseSlashCommand("/new") == .new_session);
+}
+
+test "parse slash command handles resume and model args" {
+    try std.testing.expect(parseSlashCommand("/resume") == .resume_list);
+    const resume_cmd = parseSlashCommand("/resume 20260319-010203-abcd");
+    switch (resume_cmd) {
+        .resume_id => |id| try std.testing.expectEqualStrings("20260319-010203-abcd", id),
+        else => return error.TestUnexpectedResult,
+    }
+
+    const model = parseSlashCommand("/model openai/gpt-4o");
+    switch (model) {
+        .set_model => |id| try std.testing.expectEqualStrings("openai/gpt-4o", id),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "parse slash command validates usage and unknown names" {
+    const bad_model = parseSlashCommand("/model a b");
+    try std.testing.expect(bad_model == .usage_error);
+
+    const unknown = parseSlashCommand("/wat");
+    switch (unknown) {
+        .unknown => |name| try std.testing.expectEqualStrings("wat", name),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
 test "render throttling blocks updates inside frame interval" {
     const now: i128 = 100_000_000;
     try std.testing.expect(shouldThrottleRender(now, now + 1));
@@ -1071,7 +1545,9 @@ test "tool label renders human-readable args" {
     );
     defer allocator.free(bash_label);
     try std.testing.expect(std.mem.indexOf(u8, bash_label, "Bash") != null);
-    try std.testing.expect(std.mem.indexOf(u8, bash_label, "echo hi") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bash_label, "echo") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bash_label, "hi") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bash_label, " echo hi") == null);
 }
 
 test "tool execution status rewrites same line with args" {
@@ -1115,7 +1591,9 @@ test "tool execution status rewrites same line with args" {
     try std.testing.expect(std.mem.indexOf(u8, output, "• ") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "\x1b[") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "Bash") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output, "echo hi") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "echo") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "hi") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, " echo hi") == null);
     try std.testing.expect(std.mem.indexOf(u8, output, "exit=0") == null);
     try std.testing.expect(std.mem.indexOf(u8, output, "duration_ms") == null);
     try std.testing.expect(std.mem.indexOf(u8, output, "✓") != null);
