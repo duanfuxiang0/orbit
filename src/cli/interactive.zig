@@ -11,6 +11,19 @@ const lines_util = @import("../tui/lines_util.zig");
 const posix = std.posix;
 const MIN_RENDER_INTERVAL_NS: i128 = 16_000_000;
 const MD_PADDING_X: u16 = 1;
+const max_tool_args_chars: usize = 120;
+const tool_name_orange = "\x1b[38;5;208m";
+
+const ToolLineState = enum {
+    running,
+    done,
+    err,
+};
+
+const ActiveToolLine = struct {
+    id: []u8,
+    label: []u8,
+};
 
 pub fn run(
     allocator: std.mem.Allocator,
@@ -30,7 +43,7 @@ pub fn run(
         return runLineBuffered(allocator, agent, stdout_file, stdin_file, &event_loop);
     }
 
-    var raw = try RawMode.init(stdin_file);
+    var raw = try RawMode.init(stdin_file, stdout_file);
     defer raw.deinit();
 
     var ed = tui.Editor.init(allocator, "> ");
@@ -38,52 +51,28 @@ pub fn run(
 
     var renderer = tui.InlineRenderer.init(allocator, stdout_file);
     defer renderer.deinit();
+    var decoder = tui.InputDecoder{};
 
     try renderEditor(&renderer, &ed, allocator);
 
-    var byte_buf: [1]u8 = undefined;
+    var input_ctx = InputCtx{
+        .allocator = allocator,
+        .agent = agent,
+        .editor = &ed,
+        .renderer = &renderer,
+        .writer = stdout_file,
+        .event_loop = &event_loop,
+    };
+    var byte_buf: [64]u8 = undefined;
     while (true) {
-        const count = try stdin_file.read(&byte_buf);
-        if (count == 0) break;
+        const chunk = try readInputChunk(stdin_file, &byte_buf);
+        if (chunk.len == 0) break;
 
-        const byte = byte_buf[0];
-
-        if (byte == 0x1b) {
-            var seq_buf: [8]u8 = undefined;
-            seq_buf[0] = 0x1b;
-            const seq_len = 1 + readEscapeTail(stdin_file, seq_buf[1..]);
-            const handled = try ed.handleInput(seq_buf[0..seq_len]);
-            if (handled) try renderEditor(&renderer, &ed, allocator);
-            continue;
-        }
-
-        if (byte == 0x04) {
-            if (ed.getText().len == 0) {
-                try stdout_file.writeAll("\r\n");
-                break;
-            }
-            continue;
-        }
-
-        if (byte == '\r' or byte == '\n') {
-            const should_exit = try handleSubmit(
-                allocator,
-                agent,
-                &ed,
-                &renderer,
-                stdout_file,
-                &event_loop,
-            );
-            if (should_exit) break;
-            continue;
-        }
-
-        var input_buf: [4]u8 = undefined;
-        input_buf[0] = byte;
-        const input_len = readUtf8Sequence(stdin_file, byte, &input_buf);
-
-        const handled = try ed.handleInput(input_buf[0..input_len]);
-        if (handled) try renderEditor(&renderer, &ed, allocator);
+        input_ctx.needs_render = false;
+        input_ctx.should_exit = false;
+        try decoder.pushBytes(chunk, &input_ctx, InputCtx.onInput);
+        if (input_ctx.should_exit) break;
+        if (input_ctx.needs_render) try renderEditor(&renderer, &ed, allocator);
     }
 }
 
@@ -97,7 +86,7 @@ fn handleSubmit(
     event_loop: *runtime.EventLoop,
 ) !bool {
     const text = ed.getText();
-    const trimmed = std.mem.trim(u8, text, " \t");
+    const trimmed = std.mem.trim(u8, text, " \t\r\n");
     if (trimmed.len == 0) return false;
 
     try writer.writeAll("\r\n");
@@ -116,7 +105,7 @@ fn handleSubmit(
         .emit = StreamSinkCtx.onEvent,
     };
 
-    agent.prompt(trimmed, &sink, null);
+    agent.prompt(text, &sink, null);
 
     // After agent turn, flush any remaining markdown content.
     sink_ctx.flushMarkdown();
@@ -139,9 +128,49 @@ fn renderEditor(
         for (lines) |line| allocator.free(line);
         allocator.free(lines);
     }
-    const cursor_col = ed.cursorColumn();
-    try renderer.render(lines, 0, cursor_col);
+    const cursor = try ed.cursorPosition(width);
+    try renderer.render(lines, cursor.y, cursor.x);
 }
+
+const InputCtx = struct {
+    allocator: std.mem.Allocator,
+    agent: *agent_mod.Agent,
+    editor: *tui.Editor,
+    renderer: *tui.InlineRenderer,
+    writer: std.fs.File,
+    event_loop: *runtime.EventLoop,
+    needs_render: bool = false,
+    should_exit: bool = false,
+
+    fn onInput(self: *InputCtx, event: tui.InputEvent) !void {
+        switch (event) {
+            .action => |action| switch (action) {
+                .submit => {
+                    self.should_exit = try handleSubmit(
+                        self.allocator,
+                        self.agent,
+                        self.editor,
+                        self.renderer,
+                        self.writer,
+                        self.event_loop,
+                    );
+                },
+                .end_of_transmission => {
+                    if (self.editor.getText().len == 0) {
+                        try self.writer.writeAll("\r\n");
+                        self.should_exit = true;
+                    }
+                },
+                else => {
+                    if (try self.editor.handleInput(event)) self.needs_render = true;
+                },
+            },
+            else => {
+                if (try self.editor.handleInput(event)) self.needs_render = true;
+            },
+        }
+    }
+};
 
 /// Streaming sink that accumulates text and renders markdown incrementally.
 const StreamSinkCtx = struct {
@@ -157,6 +186,7 @@ const StreamSinkCtx = struct {
     render_pending: bool,
     last_rendered_text_len: usize,
     last_render_width: u16,
+    active_tool: ?ActiveToolLine,
 
     fn init(
         allocator: std.mem.Allocator,
@@ -176,10 +206,12 @@ const StreamSinkCtx = struct {
             .render_pending = false,
             .last_rendered_text_len = 0,
             .last_render_width = 0,
+            .active_tool = null,
         };
     }
 
     fn deinit(self: *StreamSinkCtx) void {
+        self.clearActiveToolState();
         self.render_timer.deinit();
         self.text_buf.deinit(self.allocator);
         self.md.deinit();
@@ -315,6 +347,20 @@ const StreamSinkCtx = struct {
         self.flushPendingRenderLocked();
     }
 
+    fn clearActiveToolState(self: *StreamSinkCtx) void {
+        if (self.active_tool) |active| {
+            self.allocator.free(active.id);
+            self.allocator.free(active.label);
+            self.active_tool = null;
+        }
+    }
+
+    fn endDanglingToolLine(self: *StreamSinkCtx) void {
+        if (self.active_tool == null) return;
+        self.writer.writeAll("\n") catch {};
+        self.clearActiveToolState();
+    }
+
     fn onEvent(raw_ctx: *anyopaque, event: agent_types.AgentEvent) void {
         const self: *StreamSinkCtx = @ptrCast(@alignCast(raw_ctx));
         switch (event) {
@@ -331,29 +377,48 @@ const StreamSinkCtx = struct {
             },
             .tool_exec_start => |payload| {
                 self.flushMarkdown();
-                self.writer.writeAll("⟳ ") catch {};
-                self.writer.writeAll(payload.name) catch {};
-                self.writer.writeAll("\n") catch {};
+                self.endDanglingToolLine();
+
+                const label = formatToolLabel(
+                    self.allocator,
+                    payload.name,
+                    payload.arguments,
+                    max_tool_args_chars,
+                ) catch return;
+                errdefer self.allocator.free(label);
+
+                const id = self.allocator.dupe(u8, payload.id) catch return;
+                self.active_tool = .{
+                    .id = id,
+                    .label = label,
+                };
+                renderToolLine(self.writer, label, .running, false);
             },
             .tool_exec_end => |payload| {
-                const icon: []const u8 = if (payload.is_error) "✗" else "✓";
-                const color: []const u8 = if (payload.is_error)
-                    ansi.Color.red.fgCode()
-                else
-                    ansi.Color.green.fgCode();
-                self.writer.writeAll(color) catch {};
-                self.writer.writeAll(icon) catch {};
-                self.writer.writeAll(" ") catch {};
-                self.writer.writeAll(payload.name) catch {};
-                if (payload.ui_details) |details| {
-                    self.writer.writeAll(" ") catch {};
-                    self.writer.writeAll(details) catch {};
+                if (self.active_tool) |active| {
+                    if (!std.mem.eql(u8, active.id, payload.id)) {
+                        self.endDanglingToolLine();
+                    } else {
+                        const state: ToolLineState = if (payload.is_error) .err else .done;
+                        renderToolLine(self.writer, active.label, state, true);
+                        self.clearActiveToolState();
+                        return;
+                    }
                 }
-                self.writer.writeAll(ansi.reset) catch {};
-                self.writer.writeAll("\n") catch {};
+
+                const fallback_label = formatToolLabel(
+                    self.allocator,
+                    payload.name,
+                    "{}",
+                    max_tool_args_chars,
+                ) catch return;
+                defer self.allocator.free(fallback_label);
+                const fallback_state: ToolLineState = if (payload.is_error) .err else .done;
+                renderToolLine(self.writer, fallback_label, fallback_state, true);
             },
             .turn_end => |payload| {
                 self.flushMarkdown();
+                self.endDanglingToolLine();
                 var buf: [128]u8 = undefined;
                 const msg = std.fmt.bufPrint(&buf, "{s}tokens: {d} in / {d} out{s}\n", .{
                     ansi.dim,
@@ -365,6 +430,7 @@ const StreamSinkCtx = struct {
             },
             .err => |message| {
                 self.flushMarkdown();
+                self.endDanglingToolLine();
                 self.writer.writeAll(ansi.Color.red.fgCode()) catch {};
                 self.writer.writeAll("error: ") catch {};
                 self.writer.writeAll(message) catch {};
@@ -375,6 +441,214 @@ const StreamSinkCtx = struct {
         }
     }
 };
+
+fn formatToolLabel(
+    allocator: std.mem.Allocator,
+    tool_name: []const u8,
+    arguments: []const u8,
+    max_args_len: usize,
+) ![]u8 {
+    const args = try summarizeToolArguments(allocator, tool_name, arguments, max_args_len);
+    defer allocator.free(args);
+    const display_name = toolDisplayName(tool_name);
+    if (std.mem.eql(u8, args, "{}")) {
+        return std.fmt.allocPrint(
+            allocator,
+            "• {s}{s}{s}",
+            .{ tool_name_orange, display_name, ansi.reset },
+        );
+    }
+    return std.fmt.allocPrint(
+        allocator,
+        "• {s}{s}{s} {s}",
+        .{ tool_name_orange, display_name, ansi.reset, args },
+    );
+}
+
+fn summarizeToolArguments(
+    allocator: std.mem.Allocator,
+    tool_name: []const u8,
+    arguments: []const u8,
+    max_len: usize,
+) ![]u8 {
+    if (std.mem.eql(u8, tool_name, "read")) {
+        const ReadArgs = struct {
+            path: ?[]const u8 = null,
+            offset: ?u32 = null,
+            limit: ?u32 = null,
+        };
+        const parsed = std.json.parseFromSlice(ReadArgs, allocator, arguments, .{
+            .ignore_unknown_fields = true,
+        }) catch return summarizeToolText(allocator, arguments, max_len);
+        defer parsed.deinit();
+        if (parsed.value.path) |path| {
+            if (parsed.value.offset) |offset| {
+                if (parsed.value.limit) |limit| {
+                    const raw = try std.fmt.allocPrint(
+                        allocator,
+                        "{s} (offset={d}, limit={d})",
+                        .{ path, offset, limit },
+                    );
+                    defer allocator.free(raw);
+                    return summarizeToolText(allocator, raw, max_len);
+                }
+                const raw = try std.fmt.allocPrint(allocator, "{s} (offset={d})", .{ path, offset });
+                defer allocator.free(raw);
+                return summarizeToolText(allocator, raw, max_len);
+            }
+            return summarizeToolText(allocator, path, max_len);
+        }
+    }
+    if (std.mem.eql(u8, tool_name, "bash")) {
+        const BashArgs = struct {
+            command: ?[]const u8 = null,
+            timeout: ?u32 = null,
+        };
+        const parsed = std.json.parseFromSlice(BashArgs, allocator, arguments, .{
+            .ignore_unknown_fields = true,
+        }) catch return summarizeToolText(allocator, arguments, max_len);
+        defer parsed.deinit();
+        if (parsed.value.command) |command| {
+            return summarizeToolText(allocator, command, max_len);
+        }
+    }
+    if (std.mem.eql(u8, tool_name, "write")) {
+        const WriteArgs = struct { path: ?[]const u8 = null };
+        const parsed = std.json.parseFromSlice(WriteArgs, allocator, arguments, .{
+            .ignore_unknown_fields = true,
+        }) catch return summarizeToolText(allocator, arguments, max_len);
+        defer parsed.deinit();
+        if (parsed.value.path) |path| {
+            return summarizeToolText(allocator, path, max_len);
+        }
+    }
+    if (std.mem.eql(u8, tool_name, "edit")) {
+        const EditArgs = struct { path: ?[]const u8 = null };
+        const parsed = std.json.parseFromSlice(EditArgs, allocator, arguments, .{
+            .ignore_unknown_fields = true,
+        }) catch return summarizeToolText(allocator, arguments, max_len);
+        defer parsed.deinit();
+        if (parsed.value.path) |path| {
+            return summarizeToolText(allocator, path, max_len);
+        }
+    }
+
+    if (try summarizeJsonObjectFields(allocator, arguments, max_len)) |summary| {
+        return summary;
+    }
+    return summarizeToolText(allocator, arguments, max_len);
+}
+
+fn toolDisplayName(tool_name: []const u8) []const u8 {
+    if (std.mem.eql(u8, tool_name, "read")) return "Read";
+    if (std.mem.eql(u8, tool_name, "write")) return "Write";
+    if (std.mem.eql(u8, tool_name, "edit")) return "Edit";
+    if (std.mem.eql(u8, tool_name, "bash")) return "Bash";
+    return tool_name;
+}
+
+fn summarizeJsonObjectFields(
+    allocator: std.mem.Allocator,
+    text: []const u8,
+    max_len: usize,
+) !?[]u8 {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, text, .{}) catch return null;
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+
+    var out: std.ArrayList(u8) = .{};
+    defer out.deinit(allocator);
+
+    var fields: usize = 0;
+    var it = parsed.value.object.iterator();
+    while (it.next()) |entry| {
+        if (fields > 0) try out.append(allocator, ' ');
+        try out.appendSlice(allocator, entry.key_ptr.*);
+        try out.append(allocator, '=');
+        try appendJsonScalarSummary(allocator, &out, entry.value_ptr.*, max_len);
+        fields += 1;
+        if (out.items.len >= max_len) break;
+    }
+    if (fields == 0) {
+        return @as(?[]u8, try allocator.dupe(u8, "{}"));
+    }
+    return @as(?[]u8, try summarizeToolText(allocator, out.items, max_len));
+}
+
+fn appendJsonScalarSummary(
+    allocator: std.mem.Allocator,
+    out: *std.ArrayList(u8),
+    value: std.json.Value,
+    max_len: usize,
+) !void {
+    switch (value) {
+        .string => {
+            const text = try summarizeToolText(allocator, value.string, max_len);
+            defer allocator.free(text);
+            try out.appendSlice(allocator, text);
+        },
+        .integer => |v| try std.fmt.format(out.writer(allocator), "{d}", .{v}),
+        .float => |v| try std.fmt.format(out.writer(allocator), "{d}", .{v}),
+        .bool => |v| try out.appendSlice(allocator, if (v) "true" else "false"),
+        .null => try out.appendSlice(allocator, "null"),
+        else => try out.appendSlice(allocator, "..."),
+    }
+}
+
+fn summarizeToolText(allocator: std.mem.Allocator, text: []const u8, max_len: usize) ![]u8 {
+    std.debug.assert(max_len > 3);
+    var compact: std.ArrayList(u8) = .{};
+    errdefer compact.deinit(allocator);
+
+    var saw_non_space = false;
+    var pending_space = false;
+    for (text) |byte| {
+        const is_space = byte == ' ' or byte == '\n' or byte == '\r' or byte == '\t';
+        if (is_space) {
+            if (saw_non_space) pending_space = true;
+            continue;
+        }
+        if (pending_space) {
+            try compact.append(allocator, ' ');
+            pending_space = false;
+        }
+        try compact.append(allocator, byte);
+        saw_non_space = true;
+    }
+    if (!saw_non_space) {
+        return allocator.dupe(u8, "{}");
+    }
+    if (compact.items.len <= max_len) {
+        return compact.toOwnedSlice(allocator);
+    }
+    compact.shrinkRetainingCapacity(max_len - 3);
+    try compact.appendSlice(allocator, "...");
+    return compact.toOwnedSlice(allocator);
+}
+
+fn renderToolLine(
+    writer: std.fs.File,
+    label: []const u8,
+    state: ToolLineState,
+    newline: bool,
+) void {
+    const ToolStyle = struct {
+        color: []const u8,
+        icon: []const u8,
+    };
+    const style: ToolStyle = switch (state) {
+        .running => .{ .color = ansi.Color.yellow.fgCode(), .icon = "⟳" },
+        .done => .{ .color = ansi.Color.green.fgCode(), .icon = "✓" },
+        .err => .{ .color = ansi.Color.red.fgCode(), .icon = "✗" },
+    };
+    writer.writeAll("\r\x1b[2K") catch {};
+    writer.writeAll(label) catch {};
+    writer.writeAll(" ") catch {};
+    writer.writeAll(style.color) catch {};
+    writer.writeAll(style.icon) catch {};
+    writer.writeAll(ansi.reset) catch {};
+    if (newline) writer.writeAll("\n") catch {};
+}
 
 fn shouldThrottleRender(last_render_ns: i128, now_ns: i128) bool {
     if (last_render_ns == 0) return false;
@@ -491,47 +765,30 @@ fn markdownContentWidth(width: u16, padding_x: u16) usize {
     return @as(usize, width - @as(u16, @intCast(total_padding)));
 }
 
-fn readEscapeTail(stdin_file: std.fs.File, buf: []u8) usize {
-    var len: usize = 0;
+fn readInputChunk(stdin_file: std.fs.File, buf: *[64]u8) ![]const u8 {
+    const first_read = try stdin_file.read(buf[0..1]);
+    if (first_read == 0) return buf[0..0];
+
+    var len: usize = first_read;
     while (len < buf.len) {
-        var fds = [_]posix.pollfd{.{
-            .fd = stdin_file.handle,
-            .events = posix.POLL.IN,
-            .revents = 0,
-        }};
-        const ready = posix.poll(fds[0..], 0) catch return len;
-        if (ready == 0) return len;
-        if ((fds[0].revents & posix.POLL.IN) == 0) return len;
-
-        var one: [1]u8 = undefined;
-        const n = stdin_file.read(&one) catch return len;
-        if (n == 0) return len;
-        buf[len] = one[0];
-        len += 1;
-        if (one[0] >= '@' and one[0] <= '~') return len;
+        const timeout_ms: i32 = if (len == 1 and buf[0] == 0x1b) 10 else 0;
+        if (!pollReadable(stdin_file.handle, timeout_ms)) break;
+        const next_read = try stdin_file.read(buf[len .. len + 1]);
+        if (next_read == 0) break;
+        len += next_read;
     }
-    return len;
+    return buf[0..len];
 }
 
-fn readUtf8Sequence(stdin_file: std.fs.File, lead: u8, buf: *[4]u8) usize {
-    buf[0] = lead;
-    if (lead < 0x80) return 1;
-    const expected = utf8SequenceLengthFromLeadByte(lead);
-    var len: usize = 1;
-    while (len < expected and len < buf.len) {
-        const n = stdin_file.read(buf[len .. len + 1]) catch return len;
-        if (n == 0) break;
-        len += n;
-    }
-    return len;
-}
-
-fn utf8SequenceLengthFromLeadByte(first_byte: u8) usize {
-    if ((first_byte & 0b1000_0000) == 0) return 1;
-    if ((first_byte & 0b1110_0000) == 0b1100_0000) return 2;
-    if ((first_byte & 0b1111_0000) == 0b1110_0000) return 3;
-    if ((first_byte & 0b1111_1000) == 0b1111_0000) return 4;
-    return 1;
+fn pollReadable(handle: posix.fd_t, timeout_ms: i32) bool {
+    var fds = [_]posix.pollfd{.{
+        .fd = handle,
+        .events = posix.POLL.IN,
+        .revents = 0,
+    }};
+    const ready = posix.poll(fds[0..], timeout_ms) catch return false;
+    if (ready == 0) return false;
+    return (fds[0].revents & posix.POLL.IN) != 0;
 }
 
 fn runLineBuffered(
@@ -570,8 +827,12 @@ fn runLineBuffered(
 const RawMode = struct {
     handle: posix.fd_t,
     original: posix.termios,
+    writer: std.fs.File,
 
-    fn init(file: std.fs.File) !RawMode {
+    const enable_input_modes = "\x1b[?2004h\x1b[>7u\x1b[>4;2m";
+    const disable_input_modes = "\x1b[>4;0m\x1b[<u\x1b[?2004l";
+
+    fn init(file: std.fs.File, writer: std.fs.File) !RawMode {
         std.debug.assert(file.isTty());
         const original = try posix.tcgetattr(file.handle);
         var raw = original;
@@ -586,10 +847,12 @@ const RawMode = struct {
         raw.cc[@intFromEnum(posix.V.MIN)] = 1;
         raw.cc[@intFromEnum(posix.V.TIME)] = 0;
         try posix.tcsetattr(file.handle, .FLUSH, raw);
-        return .{ .handle = file.handle, .original = original };
+        writer.writeAll(enable_input_modes) catch {};
+        return .{ .handle = file.handle, .original = original, .writer = writer };
     }
 
     fn deinit(self: *const RawMode) void {
+        self.writer.writeAll(disable_input_modes) catch {};
         posix.tcsetattr(self.handle, .FLUSH, self.original) catch {};
     }
 };
@@ -608,14 +871,6 @@ fn waitForMarkdownRender(sink: *StreamSinkCtx, timeout_ms: u32) bool {
         if (now_ns - start_ns >= timeout_ns) return false;
         std.Thread.sleep(std.time.ns_per_ms);
     }
-}
-
-test "utf8 sequence length from lead byte" {
-    try std.testing.expectEqual(@as(usize, 1), utf8SequenceLengthFromLeadByte('a'));
-    try std.testing.expectEqual(@as(usize, 2), utf8SequenceLengthFromLeadByte(0xC2));
-    try std.testing.expectEqual(@as(usize, 3), utf8SequenceLengthFromLeadByte(0xE4));
-    try std.testing.expectEqual(@as(usize, 4), utf8SequenceLengthFromLeadByte(0xF0));
-    try std.testing.expectEqual(@as(usize, 1), utf8SequenceLengthFromLeadByte(0x80));
 }
 
 test "render throttling blocks updates inside frame interval" {
@@ -649,6 +904,100 @@ test "append delta to rendered lines wraps and appends" {
     try std.testing.expectEqual(@as(usize, 2), updated.len);
     try std.testing.expectEqualStrings(" hello worl", updated[0]);
     try std.testing.expectEqualStrings(" d", updated[1]);
+}
+
+test "tool summary compacts whitespace and truncates" {
+    const allocator = std.testing.allocator;
+
+    const compact = try summarizeToolText(
+        allocator,
+        "{\n  \"command\": \"echo hi\"\n}",
+        64,
+    );
+    defer allocator.free(compact);
+    try std.testing.expectEqualStrings("{ \"command\": \"echo hi\" }", compact);
+
+    const truncated = try summarizeToolText(
+        allocator,
+        "{\"path\":\"very/long/path/that/needs/truncation\"}",
+        20,
+    );
+    defer allocator.free(truncated);
+    try std.testing.expect(std.mem.endsWith(u8, truncated, "..."));
+    try std.testing.expectEqual(@as(usize, 20), truncated.len);
+}
+
+test "tool label renders human-readable args" {
+    const allocator = std.testing.allocator;
+
+    const read_label = try formatToolLabel(
+        allocator,
+        "read",
+        "{\"path\":\"AGENTS.md\"}",
+        120,
+    );
+    defer allocator.free(read_label);
+    try std.testing.expect(std.mem.indexOf(u8, read_label, "• ") == 0);
+    try std.testing.expect(std.mem.indexOf(u8, read_label, tool_name_orange) != null);
+    try std.testing.expect(std.mem.indexOf(u8, read_label, "Read") != null);
+    try std.testing.expect(std.mem.indexOf(u8, read_label, "AGENTS.md") != null);
+
+    const bash_label = try formatToolLabel(
+        allocator,
+        "bash",
+        "{\"command\":\"echo hi\"}",
+        120,
+    );
+    defer allocator.free(bash_label);
+    try std.testing.expect(std.mem.indexOf(u8, bash_label, "Bash") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bash_label, "echo hi") != null);
+}
+
+test "tool execution status rewrites same line with args" {
+    const allocator = std.testing.allocator;
+
+    var event_loop: runtime.EventLoop = undefined;
+    try event_loop.init(allocator);
+    defer event_loop.deinit();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const file = try tmp.dir.createFile("stream_sink_tool_line", .{ .read = true });
+    defer file.close();
+
+    var sink = StreamSinkCtx.init(allocator, file, &event_loop);
+    defer sink.deinit();
+
+    StreamSinkCtx.onEvent(&sink, .{
+        .tool_exec_start = .{
+            .id = "toolu_1",
+            .name = "bash",
+            .arguments = "{\"command\":\"echo hi\"}",
+        },
+    });
+    StreamSinkCtx.onEvent(&sink, .{
+        .tool_exec_end = .{
+            .id = "toolu_1",
+            .name = "bash",
+            .is_error = false,
+            .ui_details = "{\"exit_code\":0,\"duration_ms\":50}",
+        },
+    });
+
+    try file.seekTo(0);
+    const stat = try file.stat();
+    const output = try file.readToEndAlloc(allocator, @intCast(stat.size));
+    defer allocator.free(output);
+
+    try std.testing.expect(std.mem.indexOf(u8, output, "• ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, tool_name_orange) != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "Bash") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "echo hi") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "exit=0") == null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "duration_ms") == null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "✓") != null);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, output, "\n"));
 }
 
 test "throttled text delta flushes at frame deadline" {

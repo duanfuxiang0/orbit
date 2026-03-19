@@ -107,6 +107,13 @@ pub fn serializeEvent(
             try json_util.appendJsonKeyValue(&buf, allocator, "id", payload.id);
             try buf.append(allocator, ',');
             try json_util.appendJsonKeyValue(&buf, allocator, "name", payload.name);
+            try buf.append(allocator, ',');
+            try json_util.appendJsonKeyValue(
+                &buf,
+                allocator,
+                "arguments",
+                payload.arguments,
+            );
         },
         .tool_exec_end => |payload| {
             try json_util.appendJsonKeyValue(&buf, allocator, "type", "tool_exec_end");
@@ -206,5 +213,31 @@ test "serialize event emits valid json line" {
     try std.testing.expectEqualStrings(
         "text_delta",
         parsed.value.object.get("type").?.string,
+    );
+}
+
+test "serialize tool_exec_start includes arguments" {
+    const allocator = std.testing.allocator;
+    const line = try serializeEvent(allocator, .{
+        .tool_exec_start = .{
+            .id = "toolu_1",
+            .name = "bash",
+            .arguments = "{\"command\":\"echo hi\"}",
+        },
+    });
+    defer allocator.free(line);
+
+    const trimmed = std.mem.trimRight(u8, line, "\n");
+    const parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        trimmed,
+        .{},
+    );
+    defer parsed.deinit();
+
+    try std.testing.expectEqualStrings(
+        "{\"command\":\"echo hi\"}",
+        parsed.value.object.get("arguments").?.string,
     );
 }

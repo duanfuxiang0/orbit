@@ -72,6 +72,7 @@ pub const AgentEvent = union(enum) {
     tool_exec_start: struct {
         id: []const u8,
         name: []const u8,
+        arguments: []const u8,
     },
     tool_exec_end: ToolExecEndInfo,
 

@@ -238,6 +238,7 @@ pub const Agent = struct {
             .tool_exec_start = .{
                 .id = tool_call.id,
                 .name = tool_call.name,
+                .arguments = tool_call.arguments,
             },
         });
 
@@ -535,6 +536,10 @@ test "agent executes tool call and continues loop" {
     try std.testing.expectEqual(@as(u32, 2), events.turn_end_count);
     try std.testing.expectEqual(@as(u32, 1), events.tool_exec_start_count);
     try std.testing.expectEqual(@as(u32, 1), events.tool_exec_end_count);
+    try std.testing.expectEqualStrings(
+        "{\"q\":\"x\"}",
+        events.last_tool_exec_args_buf[0..events.last_tool_exec_args_len],
+    );
     try std.testing.expectEqual(types.StopReason.complete, events.last_reason.?);
     try std.testing.expectEqual(@as(u32, 11), agent.total_usage.input);
     try std.testing.expectEqual(@as(u32, 5), agent.total_usage.output);
@@ -771,6 +776,8 @@ const EventCapture = struct {
     tool_exec_end_count: u32 = 0,
     steering_injected_count: u32 = 0,
     last_reason: ?types.StopReason = null,
+    last_tool_exec_args_buf: [128]u8 = [_]u8{0} ** 128,
+    last_tool_exec_args_len: usize = 0,
 
     fn sink(self: *EventCapture) types.AgentEventSink {
         return .{
@@ -789,7 +796,15 @@ const EventCapture = struct {
             },
             .turn_start => self.turn_start_count += 1,
             .turn_end => self.turn_end_count += 1,
-            .tool_exec_start => self.tool_exec_start_count += 1,
+            .tool_exec_start => |payload| {
+                self.tool_exec_start_count += 1;
+                std.debug.assert(payload.arguments.len <= self.last_tool_exec_args_buf.len);
+                @memcpy(
+                    self.last_tool_exec_args_buf[0..payload.arguments.len],
+                    payload.arguments,
+                );
+                self.last_tool_exec_args_len = payload.arguments.len;
+            },
             .tool_exec_end => self.tool_exec_end_count += 1,
             .steering_injected => self.steering_injected_count += 1,
             else => {},
