@@ -5,10 +5,10 @@ Orbit is a standalone code agent built in Zig.
 ## Vision
 
 Orbit is a true autonomous coding assistant, not a frontend for another service. It provides:
-- Direct file system operations
-- Code execution and testing
-- Interactive CLI and headless execution modes
-- Fast, safe, and reliable operation
+- [] Direct file system operations
+- [] Code execution and testing
+- [] Interactive CLI and headless execution modes
+- [] Fast, safe, and reliable operation
 
 ## Status
 
@@ -28,7 +28,7 @@ zig build test
 
 Format code:
 ```bash
-zig fmt src/ai/*.zig src/agent/*.zig src/cli/*.zig src/main.zig src/tests.zig build.zig
+zig fmt src/*
 ```
 
 ## Project Structure
