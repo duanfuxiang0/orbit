@@ -38,6 +38,13 @@ pub fn register(
         .parameters_json = read_schema,
         .execute = executeRead,
         .ctx = ctx,
+        .prompt_snippet = "Read file contents. " ++
+            "Supports offset and limit for large files.",
+        .prompt_guidelines = &.{
+            "Use read to examine files before editing. " ++
+                "Do not use bash with cat or sed " ++
+                "to read file contents.",
+        },
     };
     tools[1] = .{
         .name = "write",
@@ -45,6 +52,12 @@ pub fn register(
         .parameters_json = write_schema,
         .execute = executeWrite,
         .ctx = ctx,
+        .prompt_snippet = "Create or overwrite files. " ++
+            "Automatically creates parent directories.",
+        .prompt_guidelines = &.{
+            "Use write only for new files " ++
+                "or complete rewrites.",
+        },
     };
     tools[2] = .{
         .name = "edit",
@@ -52,6 +65,17 @@ pub fn register(
         .parameters_json = edit_schema,
         .execute = executeEdit,
         .ctx = ctx,
+        .prompt_snippet = "Make precise text replacements " ++
+            "in files. The old_text must match exactly.",
+        .prompt_guidelines = &.{
+            "Use edit for surgical changes; " ++
+                "prefer edit over write " ++
+                "for existing files.",
+            "If edit fails due to old_text mismatch, " ++
+                "use read to verify the current file " ++
+                "content before retrying. Do not fall " ++
+                "back to write for existing files.",
+        },
     };
     tools[3] = .{
         .name = "bash",
@@ -59,6 +83,9 @@ pub fn register(
         .parameters_json = bash_schema,
         .execute = executeBash,
         .ctx = ctx,
+        .prompt_snippet = "Execute bash commands. " ++
+            "Use for file operations, search, " ++
+            "compilation, and testing.",
     };
     return tools;
 }

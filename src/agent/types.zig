@@ -28,6 +28,13 @@ pub const Tool = struct {
     ) ToolExecResult,
     ctx: *anyopaque,
 
+    /// One-line description for the "Available tools" prompt section.
+    /// If null, this tool is omitted from the prompt tool list.
+    prompt_snippet: ?[]const u8 = null,
+
+    /// Usage guidelines contributed to the "Guidelines" section.
+    prompt_guidelines: []const []const u8 = &.{},
+
     pub fn toSpec(self: Tool) ai.ToolSpec {
         return .{
             .name = self.name,

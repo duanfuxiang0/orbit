@@ -4,6 +4,7 @@ const agent_mod = @import("../agent/root.zig");
 const coding_tools = @import("coding_tools.zig");
 const config_mod = @import("config.zig");
 const context_files = @import("context_files.zig");
+const prompt_mod = @import("prompt.zig");
 const headless = @import("headless.zig");
 const interactive = @import("interactive.zig");
 const model_runtime = @import("model_runtime.zig");
@@ -42,13 +43,19 @@ pub fn run(allocator: std.mem.Allocator) !void {
     var resolved_model = try model_runtime.resolveModel(allocator, config.default_model, args.model);
     defer resolved_model.deinit(allocator);
 
-    const agents_md = try context_files.loadContextFiles(allocator, cwd);
-    defer if (agents_md) |value| allocator.free(value);
+    const ctx_files = try context_files.loadContextFiles(
+        allocator,
+        cwd,
+    );
+    defer context_files.freeContextFiles(allocator, ctx_files);
 
-    const system_prompt = try buildSystemPrompt(allocator, agents_md);
-    defer allocator.free(system_prompt);
-
-    var session = try loadOrCreateSession(allocator, &config, &args, resolved_model.model, cwd);
+    var session = try loadOrCreateSession(
+        allocator,
+        &config,
+        &args,
+        resolved_model.model,
+        cwd,
+    );
     defer session.deinit();
 
     var provider_binding = try model_runtime.ProviderBinding.init(
@@ -61,6 +68,14 @@ pub fn run(allocator: std.mem.Allocator) !void {
 
     const tools = try coding_tools.register(allocator, cwd);
     defer coding_tools.unregister(allocator, tools);
+
+    const system_prompt = try prompt_mod.buildSystemPrompt(
+        allocator,
+        tools,
+        ctx_files,
+        cwd,
+    );
+    defer allocator.free(system_prompt);
 
     var agent = agent_mod.Agent.init(
         allocator,
@@ -149,35 +164,6 @@ fn loadOrCreateSession(
     return session_mod.Session.init(allocator, model, cwd);
 }
 
-fn buildSystemPrompt(
-    allocator: std.mem.Allocator,
-    agents_md: ?[]const u8,
-) ![]const u8 {
-    const base =
-        \\You are an expert coding assistant. You help users with coding tasks
-        \\by reading files, executing commands, editing code, and writing new files.
-        \\
-        \\Available tools:
-        \\- read: Read file contents. Supports offset and limit for large files.
-        \\- bash: Execute bash commands. Use for file listing, search, compilation, testing.
-        \\- edit: Make precise text replacements in files. The old_text must match exactly.
-        \\- write: Create or overwrite files. Automatically creates parent directories.
-        \\
-        \\Guidelines:
-        \\- Use bash for exploration: ls, grep, find, cat for quick checks
-        \\- Use read for examining files before editing
-        \\- Use edit for surgical changes; prefer edit over write for existing files
-        \\- Use write only for new files or complete rewrites
-        \\- Be concise in your responses; show code, not lengthy explanations
-        \\- Run tests after making changes when a test command is available
-    ;
-
-    if (agents_md) |content| {
-        return std.fmt.allocPrint(allocator, "{s}\n\n---\n{s}", .{ base, content });
-    }
-    return allocator.dupe(u8, base);
-}
-
 fn printHelp() !void {
     const text =
         \\orbit
@@ -202,10 +188,6 @@ fn printHelp() !void {
     try std.fs.File.stdout().writeAll(text ++ "\n");
 }
 
-test "build system prompt appends agents md" {
-    const allocator = std.testing.allocator;
-    const prompt = try buildSystemPrompt(allocator, "Project rules");
-    defer allocator.free(prompt);
-
-    try std.testing.expect(std.mem.indexOf(u8, prompt, "Project rules") != null);
+test {
+    _ = prompt_mod;
 }

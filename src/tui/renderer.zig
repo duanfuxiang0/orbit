@@ -57,7 +57,7 @@ pub const InlineRenderer = struct {
         if (changed) |base_range| {
             range = base_range;
             if (self.changeIsAboveViewport(range.first)) {
-                range.first = 0;
+                range.first = self.viewportTop();
                 range.last = max_len - 1;
             }
 
@@ -128,13 +128,20 @@ pub const InlineRenderer = struct {
         self.last_width = width;
     }
 
-    fn changeIsAboveViewport(self: *const InlineRenderer, first_changed: usize) bool {
-        const term_size = terminal.getTerminalSize();
-        const term_height_u32: u32 = term_size.height;
-        if (self.max_lines_rendered <= term_height_u32) return false;
-        const viewport_top_u32 = self.max_lines_rendered - term_height_u32;
-        const viewport_top: usize = @intCast(viewport_top_u32);
-        return first_changed < viewport_top;
+    fn viewportTop(self: *const InlineRenderer) usize {
+        const term_h: usize = @intCast(
+            terminal.getTerminalSize().height,
+        );
+        const cursor: usize = @intCast(self.last_cursor_row);
+        if (cursor >= term_h) return cursor + 1 - term_h;
+        return 0;
+    }
+
+    fn changeIsAboveViewport(
+        self: *const InlineRenderer,
+        first_changed: usize,
+    ) bool {
+        return first_changed < self.viewportTop();
     }
 
     fn renderDiffRange(
@@ -143,18 +150,26 @@ pub const InlineRenderer = struct {
         lines: []const []const u8,
         range: ChangedRange,
     ) !i32 {
-        try self.moveCursorToTop(out);
-        if (range.first > 0) {
-            try out.writer(self.allocator).print("\x1b[{d}B", .{range.first});
+        const effective_top = try self.moveCursorToTop(out);
+        const first = @max(range.first, effective_top);
+        const skip = first - effective_top;
+        if (skip > 0) {
+            try out.writer(self.allocator).print(
+                "\x1b[{d}B",
+                .{skip},
+            );
         }
 
-        var row: usize = range.first;
+        var row: usize = first;
         while (true) {
-            if (row > range.first) {
+            if (row > first) {
                 try out.appendSlice(self.allocator, "\r\n");
             }
 
-            const line: ?[]const u8 = if (row < lines.len) lines[row] else null;
+            const line: ?[]const u8 = if (row < lines.len)
+                lines[row]
+            else
+                null;
             try writeLine(out, self.allocator, line);
 
             if (row == range.last) break;
@@ -180,11 +195,22 @@ pub const InlineRenderer = struct {
         return row;
     }
 
-    fn moveCursorToTop(self: *InlineRenderer, out: *std.ArrayList(u8)) !void {
+    /// Move cursor to the top of reachable content.
+    /// Returns the content line the cursor lands on
+    /// (may be > 0 when content has scrolled past the
+    /// terminal viewport).
+    fn moveCursorToTop(
+        self: *InlineRenderer,
+        out: *std.ArrayList(u8),
+    ) !usize {
         if (self.last_cursor_row > 0) {
-            try out.writer(self.allocator).print("\x1b[{d}A", .{self.last_cursor_row});
+            try out.writer(self.allocator).print(
+                "\x1b[{d}A",
+                .{self.last_cursor_row},
+            );
         }
         try out.appendSlice(self.allocator, "\r");
+        return self.viewportTop();
     }
 
     fn updateMaxLinesRendered(self: *InlineRenderer, line_count: usize) void {
@@ -466,7 +492,7 @@ test "inline renderer width change invalidates and redraws full content" {
     try std.testing.expect(std.mem.indexOf(u8, delta, "second") != null);
 }
 
-test "inline renderer forces full redraw when change is above viewport" {
+test "inline renderer clamps range when change is above viewport" {
     const allocator = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
@@ -478,33 +504,46 @@ test "inline renderer forces full redraw when change is above viewport" {
     var r = InlineRenderer.init(allocator, file);
     defer r.deinit();
 
-    const old_lines = [_][]const u8{
-        "line-0",
-        "line-1",
-        "line-2",
-        "line-3",
-        "line-4",
-        "line-5",
-    };
-    try r.render(&old_lines, 5, 0);
+    // Build enough lines to scroll past the terminal viewport.
+    const term_h: usize = @intCast(
+        terminal.getTerminalSize().height,
+    );
+    const line_count = term_h + 6;
+    const cursor_row: u16 = @intCast(line_count - 1);
 
-    const term_height = terminal.getTerminalSize().height;
-    r.max_lines_rendered = @as(u32, term_height) + 4;
+    const old_lines = try allocator.alloc(
+        []const u8,
+        line_count,
+    );
+    defer allocator.free(old_lines);
+    const new_lines = try allocator.alloc(
+        []const u8,
+        line_count,
+    );
+    defer allocator.free(new_lines);
+
+    for (0..line_count) |i| {
+        old_lines[i] = if (i == 0) "line-0" else "filler";
+        new_lines[i] = if (i == 0)
+            "line-0-updated"
+        else
+            "filler";
+    }
+
+    try r.render(old_lines, cursor_row, 0);
 
     const start = try fileSize(file);
-    const new_lines = [_][]const u8{
-        "line-0-updated",
-        "line-1",
-        "line-2",
-        "line-3",
-        "line-4",
-        "line-5",
-    };
-    try r.render(&new_lines, 5, 0);
+    try r.render(new_lines, cursor_row, 0);
 
     const delta = try readDelta(allocator, file, start);
     defer allocator.free(delta);
 
-    try std.testing.expect(std.mem.indexOf(u8, delta, "line-0-updated") != null);
-    try std.testing.expect(std.mem.indexOf(u8, delta, "line-4") != null);
+    // Line 0 is above the viewport — must not appear.
+    try std.testing.expect(
+        std.mem.indexOf(u8, delta, "line-0-updated") == null,
+    );
+    // Viewport lines should still be re-rendered.
+    try std.testing.expect(
+        std.mem.indexOf(u8, delta, "filler") != null,
+    );
 }
