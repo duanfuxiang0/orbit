@@ -21,6 +21,18 @@ Build and run:
 zig build run
 ```
 
+Install from source (user-local):
+```bash
+zig build --release=small --prefix ~/.local
+# Ensure ~/.local/bin is in your PATH
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+Install (from GitHub Release):
+```bash
+curl -fsSL https://raw.githubusercontent.com/duanfuxiang0/orbit/main/install.sh | bash
+```
+
 Run tests:
 ```bash
 zig build test
@@ -36,6 +48,19 @@ Format code:
 ```bash
 zig fmt src/*
 ```
+
+## Release Packaging
+
+Build release artifacts (tarballs + SHA256 checksums):
+```bash
+scripts/release.sh v0.1.0
+```
+
+Artifacts are generated in `dist/v0.1.0/`:
+- `orbit-v0.1.0-<target>.tar.gz`
+- `checksums.txt`
+
+Upload them to the matching GitHub Release tag (`v0.1.0`).
 
 ## Project Structure
 
